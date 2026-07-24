@@ -71,6 +71,10 @@ uv run python -m glyph_gnn.train --data dataset/train --out training/checkpoints
 - Focal Loss(`--focal-alpha` / `--focal-gamma`)でクラスインバランスを補正
 - ベストチェックポイントは境界クラス(負例)F1 で選択
 - 学習成果物は `training/checkpoints/<run>/` 配下にまとめる(ディレクトリごと gitignore)
+- 起動時にデータセット統計・モデル規模・ハイパーパラメータのサマリを表示し、
+  シャード読み込み / エポック / バッチ / 検証の進捗バーを出す
+  (パイプ出力時は自動で無効。`--no-progress` で明示的に抑止)
+- エポックごとに loss・学習率・経過時間・スループット・検証指標を 1 行で出力
 
 ### 3. ONNX エクスポート
 

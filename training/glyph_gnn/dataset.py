@@ -8,6 +8,7 @@ from pathlib import Path
 import msgpack
 import torch
 from torch_geometric.data import Data
+from tqdm.auto import tqdm
 
 
 def load_shard(path: Path) -> list[Data]:
@@ -37,6 +38,7 @@ def load_dataset(
     split_by_font: bool = True,
     seed: int = 0,
     limit_shards: int | None = None,
+    progress: bool = True,
 ) -> tuple[list[Data], list[Data]]:
     """Loads all shards and returns (train, val).
 
@@ -50,8 +52,11 @@ def load_dataset(
         shards = shards[:limit_shards]
 
     graphs: list[Data] = []
-    for p in shards:
+    bar = tqdm(shards, desc="loading shards", unit="shard", disable=None if progress else True)
+    for p in bar:
         graphs.extend(load_shard(p))
+        bar.set_postfix(graphs=len(graphs), refresh=False)
+    bar.close()
 
     rng = random.Random(seed)
     if split_by_font:
