@@ -29,10 +29,8 @@ demo text ──> glyph-core 前処理 ──> ort 推論 <── model.onnx <�
 # Rust 側(ビルドのみ)
 cargo build --release
 
-# Python 側
-python -m venv .venv
-.venv/Scripts/python -m pip install torch --index-url https://download.pytorch.org/whl/cu121  # GPU
-.venv/Scripts/python -m pip install -r training/requirements.txt
+# Python 側 (uv)。Linux/Windows は CUDA 12.6 版 torch を解決
+uv sync
 ```
 
 ## 使い方
@@ -53,8 +51,7 @@ cargo run --release -p dataset-gen -- \
 ### 2. 学習(フェーズ2)
 
 ```bash
-cd training
-python -m glyph_gnn.train --data ../dataset/train --out checkpoints/run --epochs 30
+uv run python -m glyph_gnn.train --data dataset/train --out training/checkpoints/run --epochs 30
 ```
 
 - 検証分割はデフォルトでフォント単位のホールドアウト(未学習フォント汎化を測定)
@@ -65,7 +62,7 @@ python -m glyph_gnn.train --data ../dataset/train --out checkpoints/run --epochs
 ### 3. ONNX エクスポート
 
 ```bash
-python -m glyph_gnn.export_onnx --checkpoint checkpoints/run/best.pt --out ../model.onnx
+uv run python -m glyph_gnn.export_onnx --checkpoint training/checkpoints/run/best.pt --out model.onnx
 ```
 
 動的軸(ノード数・エッジ数)でエクスポートし、onnxruntime と PyTorch の
@@ -96,7 +93,7 @@ cargo run --release -p glyph-infer -- --model model.onnx \
   インストールしていない場合は、CUDA 版 PyTorch が同梱する DLL を流用できる:
 
 ```bash
-PATH="<venv>/Lib/site-packages/torch/lib:$PATH" \
+PATH=".venv/Lib/site-packages/torch/lib:$PATH" \
     cargo run --release -p glyph-infer -- --model model.onnx eval --shard ...
 ```
 

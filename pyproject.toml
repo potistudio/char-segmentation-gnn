@@ -1,0 +1,34 @@
+[project]
+name = "char-segmentation-gnn"
+version = "0.0.1"
+description = "Character Segmentation with GNN"
+readme = "README.md"
+requires-python = ">=3.14"
+dependencies = [
+    "torch>=2.4",
+    "torch-geometric>=2.5",
+    "msgpack>=1.0",
+    "numpy>=1.26",
+    "onnx>=1.16",
+    "onnxruntime>=1.18",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["training/glyph_gnn"]
+
+[tool.uv]
+package = true
+
+[[tool.uv.index]]
+name = "pytorch-cu126"
+url = "https://download.pytorch.org/whl/cu126"
+explicit = true
+
+[tool.uv.sources]
+torch = [
+    { index = "pytorch-cu126", marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
+]

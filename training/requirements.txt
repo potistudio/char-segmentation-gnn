@@ -1,8 +1,0 @@
-# Install PyTorch with CUDA first (RTX 3060 -> cu121 or newer), e.g.:
-#   pip install torch --index-url https://download.pytorch.org/whl/cu121
-torch>=2.4
-torch_geometric>=2.5
-msgpack>=1.0
-numpy>=1.26
-onnx>=1.16
-onnxruntime>=1.18
