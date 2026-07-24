@@ -1,0 +1,17 @@
+# ASCII + kana + common kanji (recommended for bilingual training).
+ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789
+あいうえおかきくけこさしすせそたちつてとなにぬねのはひふへほまみむめもやゆよらりるれろわをん
+アイウエオカキクケコサシスセソタチツテトナニヌネノハヒフヘホマミムメモヤユヨラリルレロワヲン
+一二三四五六七八九十百千万円
+年月日時分秒週
+人大小中上下左右内外前後
+東西南北
+天地水火木金土
+山川海空雨雪風
+見聞言語読書文字本
+学校会社国家社会世界
+食飲米肉魚
+行来出入立走休
+白黒赤青
+新古長短高低
+父母男女

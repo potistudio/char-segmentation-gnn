@@ -43,6 +43,19 @@ cargo run --release -p dataset-gen -- \
     --count 100000 --out dataset/train
 ```
 
+日本語データセット例（`charsets/` のプリセットを利用）:
+
+```bash
+cargo run --release -p dataset-gen -- \
+    --body-fonts fonts/ja-train --deco-fonts fonts/ja-train \
+    --charset-file charsets/japanese-mixed.txt \
+    --count 100000 --out dataset/ja-train
+```
+
+- `--charset` … インラインで文字集合を指定（デフォルトは英数字）
+- `--charset-file` … UTF-8 テキストファイルから文字集合を読み込み（`#` 行頭コメントと空行は無視。同一文字の重複は出現率を上げる）
+- 同梱プリセット: `charsets/ascii.txt`, `hiragana.txt`, `katakana.txt`, `kana.txt`, `japanese-basic.txt`, `japanese-mixed.txt`
+
 - 本文フォント:装飾フォント = 7:3(`--deco-ratio` で変更可)
 - データ拡張: 負のトラッキング(パス交差の生成)、ベースライン上下動、
   アスペクト比変更、ポイントノイズ
@@ -123,7 +136,7 @@ PATH=".venv/Lib/site-packages/torch/lib:$PATH" \
 パイプライン(rustybuzz シェーピング → 輪郭抽出 → グラフ化)は文字体系に
 依存しないため、**学習データに日本語を含めることで対応する**。
 
-- `dataset-gen --charset` にかな・漢字を指定し、日本語フォントのプールを
+- `dataset-gen --charset-file`（または `--charset`）にかな・漢字を指定し、日本語フォントのプールを
   `--body-fonts` に渡す(`.ttc` コレクションはフェイス0で読み込み対応済み)
 - 漢字は1文字が多数の輪郭(ストローク)で構成されるためグラフが大きく、
   英数字より推論コストが高い(実測 約6ms/件 @ RTX 3060)
