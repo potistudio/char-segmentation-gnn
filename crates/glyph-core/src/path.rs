@@ -117,14 +117,10 @@ impl OutlineBuilder for ContourBuilder {
         for i in 1..=CURVE_STEPS {
             let t = i as f32 / CURVE_STEPS as f32;
             let u = 1.0 - t;
-            let px = u.powi(3) * p0[0]
-                + 3.0 * u * u * t * x1
-                + 3.0 * u * t * t * x2
-                + t.powi(3) * x;
-            let py = u.powi(3) * p0[1]
-                + 3.0 * u * u * t * y1
-                + 3.0 * u * t * t * y2
-                + t.powi(3) * y;
+            let px =
+                u.powi(3) * p0[0] + 3.0 * u * u * t * x1 + 3.0 * u * t * t * x2 + t.powi(3) * x;
+            let py =
+                u.powi(3) * p0[1] + 3.0 * u * u * t * y1 + 3.0 * u * t * t * y2 + t.powi(3) * y;
             self.current.push([px, py]);
         }
         self.last = [x, y];

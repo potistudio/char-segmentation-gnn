@@ -8,7 +8,7 @@ use kiddo::{KdTree, SquaredEuclidean};
 use serde::{Deserialize, Serialize};
 
 use crate::path::Contour;
-use crate::sample::{resample_contour, SampleConfig};
+use crate::sample::{SampleConfig, resample_contour};
 
 /// Feature vector width per node. Kept as a constant so Rust and Python agree.
 pub const NODE_DIM: usize = 13;

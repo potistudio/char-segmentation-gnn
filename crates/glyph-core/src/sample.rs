@@ -55,8 +55,8 @@ pub fn resample_contour(contour: &Contour, scale: f32, cfg: &SampleConfig) -> Ve
         return Vec::new();
     }
 
-    let count = ((total * scale / cfg.spacing).round() as usize)
-        .clamp(cfg.min_points, cfg.max_points);
+    let count =
+        ((total * scale / cfg.spacing).round() as usize).clamp(cfg.min_points, cfg.max_points);
     let step = total / count as f32;
 
     let mut out = Vec::with_capacity(count);

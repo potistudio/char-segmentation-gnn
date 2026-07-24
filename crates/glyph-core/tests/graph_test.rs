@@ -1,4 +1,4 @@
-use glyph_core::{build_graph, Contour, ContourInstance, GraphConfig, NODE_DIM};
+use glyph_core::{Contour, ContourInstance, GraphConfig, NODE_DIM, build_graph};
 
 fn square(cx: f32, cy: f32, half: f32) -> Contour {
     Contour {
@@ -16,8 +16,14 @@ fn builds_labeled_graph_from_two_characters() {
     let upem = 1000.0;
     // Two "characters": overlapping squares on the left, one square far right.
     let contours = vec![
-        ContourInstance { contour: square(0.0, 0.0, 300.0), char_id: 0 },
-        ContourInstance { contour: square(150.0, 0.0, 300.0), char_id: 1 },
+        ContourInstance {
+            contour: square(0.0, 0.0, 300.0),
+            char_id: 0,
+        },
+        ContourInstance {
+            contour: square(150.0, 0.0, 300.0),
+            char_id: 1,
+        },
     ];
     let g = build_graph(&contours, upem, &GraphConfig::default());
 
@@ -48,9 +54,15 @@ fn builds_labeled_graph_from_two_characters() {
 fn distant_contours_are_disconnected() {
     let upem = 1000.0;
     let contours = vec![
-        ContourInstance { contour: square(0.0, 0.0, 200.0), char_id: 0 },
+        ContourInstance {
+            contour: square(0.0, 0.0, 200.0),
+            char_id: 0,
+        },
         // 5 em away: far beyond the default 0.25em connection radius.
-        ContourInstance { contour: square(5000.0, 0.0, 200.0), char_id: 1 },
+        ContourInstance {
+            contour: square(5000.0, 0.0, 200.0),
+            char_id: 1,
+        },
     ];
     let g = build_graph(&contours, upem, &GraphConfig::default());
     // No cross-character edges should exist at this distance.
