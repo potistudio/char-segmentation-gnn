@@ -9,7 +9,7 @@ publish = { workspace = true }
 [dependencies]
 anyhow = "1.0.104"
 clap = { version = "4.6.4", features = ["derive"] }
-glyph-core = { version = "0.1.0", path = "../glyph-core" }
+glyph-core = { workspace = true }
 rand = "0.10.2"
 rand_pcg = "0.10.2"
 rayon = "1.12.0"
