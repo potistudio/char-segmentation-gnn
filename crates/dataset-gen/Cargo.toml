@@ -1,0 +1,17 @@
+[package]
+name = "dataset-gen"
+version = { workspace = true }
+edition = { workspace = true }
+authors = { workspace = true }
+license = { workspace = true }
+publish = { workspace = true }
+
+[dependencies]
+anyhow = "1.0.104"
+clap = { version = "4.6.4", features = ["derive"] }
+glyph-core = { version = "0.1.0", path = "../glyph-core" }
+rand = "0.10.2"
+rand_pcg = "0.10.2"
+rayon = "1.12.0"
+rmp-serde = "1.3.1"
+serde = { version = "1.0.229", features = ["derive"] }

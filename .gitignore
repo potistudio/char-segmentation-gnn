@@ -1,5 +1,20 @@
 # macOS dummy file
 .DS_Store
 
+# Cargo artifacts
+/target/
+
+# Python cache
+/.venv/
+__pycache__/
+
+# Artifacts
+*.onnx
+training/checkpoints/
+
+# Assets
+dataset/
+fonts/
+
 # Personal References
 refs/
