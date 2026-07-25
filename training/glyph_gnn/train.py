@@ -13,9 +13,10 @@ from pathlib import Path
 import torch
 from tqdm.auto import tqdm
 
-from .dataset import load_dataset, make_loader
+from .dataset import graph_stats, load_dataset, load_packed, make_loader
 from .loss import focal_loss
 from .model import GlyphEdgeGNN
+from .pack import is_packed
 
 
 def format_duration(seconds: float) -> str:
@@ -24,15 +25,6 @@ def format_duration(seconds: float) -> str:
     minutes, secs = divmod(int(seconds), 60)
     hours, minutes = divmod(minutes, 60)
     return f"{hours}h {minutes:02d}m {secs:02d}s" if hours else f"{minutes}m {secs:02d}s"
-
-
-def dataset_stats(graphs) -> dict:
-    nodes = sum(int(g.num_nodes) for g in graphs)
-    edges = sum(int(g.y.numel()) for g in graphs)
-    positives = sum(int(g.y.sum()) for g in graphs)
-    fonts = len({g.font for g in graphs})
-    return {"graphs": len(graphs), "nodes": nodes, "edges": edges,
-            "pos_ratio": positives / edges if edges else 0.0, "fonts": fonts}
 
 
 def print_run_summary(args, model, train_stats, val_stats, steps_per_epoch) -> None:
@@ -65,9 +57,10 @@ def print_run_summary(args, model, train_stats, val_stats, steps_per_epoch) -> N
         f"{args.epochs} epochs | batch <= {args.batch_size} graphs"
         f" / {args.max_edges_per_batch:,} edges | {steps_per_epoch:,} steps/epoch"
     )
+    source = "packed (memory-mapped)" if is_packed(args.data) else "msgpack (in memory)"
     rows = [
         ("device", device_label),
-        ("data", str(args.data)),
+        ("data", f"{args.data} | {source}"),
         ("train", describe(train_stats)),
         ("val", val_row),
         ("model", model_row),
@@ -148,7 +141,10 @@ def main() -> None:
     ap.add_argument("--focal-gamma", type=float, default=2.0)
     ap.add_argument("--val-frac", type=float, default=0.1)
     ap.add_argument("--random-split", action="store_true", help="split by sample instead of by font")
-    ap.add_argument("--limit-shards", type=int, default=None)
+    ap.add_argument("--limit-shards", type=int, default=None,
+                    help="msgpack input only; pack a subset instead for packed stores")
+    ap.add_argument("--num-workers", type=int, default=0,
+                    help="loader worker processes; only used for packed stores")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     ap.add_argument("--no-progress", action="store_true", help="disable progress bars")
@@ -158,18 +154,31 @@ def main() -> None:
     torch.manual_seed(args.seed)
     device = torch.device(args.device)
 
-    train_set, val_set = load_dataset(
-        args.data,
-        val_frac=args.val_frac,
-        split_by_font=not args.random_split,
-        seed=args.seed,
-        limit_shards=args.limit_shards,
-        progress=progress,
-    )
+    packed = is_packed(args.data)
+    if packed:
+        train_set, val_set = load_packed(
+            args.data,
+            val_frac=args.val_frac,
+            split_by_font=not args.random_split,
+            seed=args.seed,
+        )
+    else:
+        train_set, val_set = load_dataset(
+            args.data,
+            val_frac=args.val_frac,
+            split_by_font=not args.random_split,
+            seed=args.seed,
+            limit_shards=args.limit_shards,
+            progress=progress,
+        )
 
+    workers = args.num_workers if packed else 0
+    if args.num_workers and not packed:
+        print("--num-workers ignored: in-memory graphs would be copied to every worker")
     train_loader = make_loader(train_set, args.max_edges_per_batch, args.batch_size,
-                               shuffle=True, seed=args.seed)
-    val_loader = make_loader(val_set, args.max_edges_per_batch, args.batch_size)
+                               shuffle=True, seed=args.seed, num_workers=workers)
+    val_loader = make_loader(val_set, args.max_edges_per_batch, args.batch_size,
+                             num_workers=workers)
 
     model = GlyphEdgeGNN(
         hidden=args.hidden, layers=args.layers, heads=args.heads, dropout=args.dropout
@@ -177,7 +186,7 @@ def main() -> None:
     optim = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(optim, T_max=args.epochs)
 
-    print_run_summary(args, model, dataset_stats(train_set), dataset_stats(val_set),
+    print_run_summary(args, model, graph_stats(train_set), graph_stats(val_set),
                       len(train_loader))
 
     out_dir = Path(args.out)

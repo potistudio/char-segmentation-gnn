@@ -88,6 +88,33 @@ uv run python -m glyph_gnn.train --data dataset/train --out training/checkpoints
 - `--batch-size`(デフォルト 64)… 1 バッチのグラフ数上限として併用
 - それでも OOM したバッチはスキップして学習を継続し、エポック末に件数を報告
 
+#### ホスト RAM とパック済みストア
+
+`--data` に `.msgpack` シャードのディレクトリを渡すと全件を RAM に展開する。
+シャードは float を MessagePack の配列要素として持つため、デコードは
+1 シャード約 8 秒かかり、いったん Python のリストとして実体化される。
+22 GiB のコーパスはテンソルで約 27.5 GiB になり、展開中の一時領域も加わるので
+32 GiB マシンでは載らない。
+
+`glyph_gnn.pack` で一度フラットなバイナリに変換しておくと、
+`train.py` が自動的に検出して `np.memmap` 経由で読む。
+
+```bash
+uv run python -m glyph_gnn.pack --data dataset/ja-train --out dataset/ja-train-packed
+uv run python -m glyph_gnn.train --data dataset/ja-train-packed --out training/checkpoints/run
+```
+
+- 常駐 RAM はデータセット規模から切り離され、OS のページキャッシュ任せになる
+  (足りなければ回収されるだけなので、ディスクが許す限りデータセットを増やせる)
+- 起動時のシャード読み込みが消える(全体で 9 分 → 0 秒)
+- サンプル単位のランダムアクセスなので、全体シャッフルもエッジ予算バッチも
+  RAM 版とまったく同じ挙動になる
+- 保存する型は Rust の `GraphSample` と同じ(`edge_index` は u32、
+  `edge_labels` は u8)なので変換は可逆。PyG が要求する int64 / float32 への
+  キャストは読み出し時に行う
+- `--num-workers` はパック済みストアでのみ有効(RAM 版はグラフが全ワーカーに
+  複製されるため無視される)
+
 ### 3. ONNX エクスポート
 
 ```bash
