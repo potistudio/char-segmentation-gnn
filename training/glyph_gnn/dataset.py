@@ -22,7 +22,18 @@ from torch_geometric.data import Data
 from torch_geometric.loader import DataLoader
 from tqdm.auto import tqdm
 
-from .pack import INDEX_NAME, STREAMS
+from .pack import (
+    DIST,
+    DX,
+    DY,
+    FORMAT_VERSION,
+    INDEX_NAME,
+    LABEL_BIT,
+    SAME_CONTOUR,
+    SAME_CONTOUR_BIT,
+    STREAMS,
+    edge_distance,
+)
 
 
 def load_shard(path: Path) -> list[Data]:
@@ -120,6 +131,12 @@ class PackedGlyphDataset(torch.utils.data.Dataset):
     def __init__(self, root: str | Path, ids: Sequence[int] | None = None):
         self.root = Path(root)
         index = np.load(self.root / INDEX_NAME, allow_pickle=False)
+        version = int(index["version"]) if "version" in index else 1
+        if version != FORMAT_VERSION:
+            raise ValueError(
+                f"{self.root} uses packed format v{version}, this build reads "
+                f"v{FORMAT_VERSION}; re-run glyph_gnn.pack"
+            )
         self.node_dim, self.edge_dim = (int(v) for v in index["dims"])
         self.num_nodes = index["num_nodes"].astype(np.int64)
         self.num_edges = index["num_edges"].astype(np.int64)
@@ -127,10 +144,10 @@ class PackedGlyphDataset(torch.utils.data.Dataset):
         self.fonts = index["fonts"][index["font_id"]]
         self.texts = index["texts"]
         self._offsets = {
-            "node_features": _starts(self.num_nodes * self.node_dim),
+            "x": _starts(self.num_nodes * self.node_dim),
             "edge_index": _starts(self.num_edges * 2),
-            "edge_features": _starts(self.num_edges * self.edge_dim),
-            "edge_labels": _starts(self.num_edges),
+            "edge_delta": _starts(self.num_edges * 2),
+            "flags": _starts(self.num_edges),
         }
         self.ids = (np.arange(len(self.num_nodes), dtype=np.int64) if ids is None
                     else np.asarray(ids, dtype=np.int64))
@@ -163,26 +180,54 @@ class PackedGlyphDataset(torch.utils.data.Dataset):
     def __len__(self) -> int:
         return len(self.ids)
 
+    def _edge_attr(self, gid: int, e: int, flags: np.ndarray) -> np.ndarray:
+        """Rebuilds the four edge features from the two stored columns."""
+        delta = self._read("edge_delta", gid, 2 * e).reshape(e, 2)
+        attr = np.empty((e, self.edge_dim), dtype=np.float32)
+        attr[:, [DX, DY]] = delta
+        attr[:, DIST] = edge_distance(delta)
+        attr[:, SAME_CONTOUR] = (flags & SAME_CONTOUR_BIT) != 0
+        return attr
+
     def __getitem__(self, i: int) -> Data:
         gid = int(self.ids[i])
         n, e = int(self.num_nodes[gid]), int(self.num_edges[gid])
+        flags = self._read("flags", gid, e)
         data = Data(
             x=torch.from_numpy(
-                self._read("node_features", gid, n * self.node_dim).copy()
+                self._read("x", gid, n * self.node_dim).copy()
             ).view(n, self.node_dim),
-            # Stored narrow (u32/u8) to match the Rust types; PyG needs
-            # int64 indices and the loss needs float targets.
+            # Node ids are stored as u16; PyG indexes with int64.
             edge_index=torch.from_numpy(
                 self._read("edge_index", gid, 2 * e).astype(np.int64)
             ).view(2, e),
-            edge_attr=torch.from_numpy(
-                self._read("edge_features", gid, e * self.edge_dim).copy()
-            ).view(e, self.edge_dim),
-            y=torch.from_numpy(self._read("edge_labels", gid, e).astype(np.float32)),
+            edge_attr=torch.from_numpy(self._edge_attr(gid, e, flags)),
+            y=torch.from_numpy(((flags & LABEL_BIT) != 0).astype(np.float32)),
         )
         data.font = str(self.fonts[gid])
         data.text = str(self.texts[gid])
         return data
+
+    def warm_cache(self, progress: bool = True) -> int:
+        """Reads the streams end to end to prime the OS page cache.
+
+        Faulting a cold store in randomly is seek-bound (9 MB/s on the
+        spinning disk this was measured on) while a linear pass runs at
+        platter speed (67 MiB/s), so when the store fits in RAM it is far
+        cheaper to pay for one sequential read than to let the first epoch
+        pull the same bytes in batch by batch.
+        """
+        paths = [self.root / name for name, _ in STREAMS.values()]
+        total = sum(p.stat().st_size for p in paths)
+        bar = tqdm(total=total, desc="warming cache", unit="B", unit_scale=True,
+                   disable=None if progress else True)
+        buffer = bytearray(8 << 20)
+        for path in paths:
+            with open(path, "rb", buffering=0) as f:
+                while read := f.readinto(buffer):
+                    bar.update(read)
+        bar.close()
+        return total
 
     @property
     def edge_counts(self) -> np.ndarray:

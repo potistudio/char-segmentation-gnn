@@ -145,6 +145,9 @@ def main() -> None:
                     help="msgpack input only; pack a subset instead for packed stores")
     ap.add_argument("--num-workers", type=int, default=0,
                     help="loader worker processes; only used for packed stores")
+    ap.add_argument("--warm-cache", action="store_true",
+                    help="read the packed store sequentially first; on a spinning disk"
+                         " this is far cheaper than faulting it in at random")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     ap.add_argument("--no-progress", action="store_true", help="disable progress bars")
@@ -171,6 +174,15 @@ def main() -> None:
             limit_shards=args.limit_shards,
             progress=progress,
         )
+
+    if args.warm_cache:
+        if not packed:
+            print("--warm-cache ignored: msgpack shards are already read into memory")
+        else:
+            t0 = time.time()
+            read = train_set.warm_cache(progress)
+            print(f"warmed {read / 2**30:.2f} GiB of page cache"
+                  f" in {format_duration(time.time() - t0)}")
 
     workers = args.num_workers if packed else 0
     if args.num_workers and not packed:
