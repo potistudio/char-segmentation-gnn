@@ -104,11 +104,16 @@ def run_export(
     ]
     if cpu:
         cmd.append("--cpu")
-    proc = subprocess.run(cmd, capture_output=True, text=True, check=False)
+    # JSON from glyph-infer is UTF-8; Windows defaults to cp932 for text=True.
+    proc = subprocess.run(cmd, capture_output=True, check=False)
     if proc.returncode != 0:
-        detail = proc.stderr.strip() or proc.stdout.strip() or f"exit {proc.returncode}"
+        stderr = proc.stderr.decode("utf-8", errors="replace").strip()
+        stdout = proc.stdout.decode("utf-8", errors="replace").strip()
+        detail = stderr or stdout or f"exit {proc.returncode}"
         raise RuntimeError(detail)
-    return ExportData.from_json(json.loads(proc.stdout))
+    if not proc.stdout:
+        raise RuntimeError("glyph-infer export produced no output")
+    return ExportData.from_json(json.loads(proc.stdout.decode("utf-8")))
 
 
 def contour_to_group(contour_groups: list[list[int]]) -> dict[int, int]:
