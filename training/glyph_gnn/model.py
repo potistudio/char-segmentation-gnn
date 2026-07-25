@@ -105,3 +105,19 @@ class GlyphEdgeGNN(nn.Module):
         hs, hd = hx[src], hx[dst]
         feats = torch.cat([hs, hd, (hs - hd).abs(), edge_attr], dim=-1)
         return self.classifier(feats).squeeze(-1)
+
+
+MODEL_HPARAM_KEYS = frozenset(
+    {"node_dim", "edge_dim", "hidden", "layers", "heads", "dropout"}
+)
+GRAPH_HPARAM_KEYS = frozenset({"knn", "radius", "contour_bridge"})
+
+
+def model_hparams(hparams: dict) -> dict:
+    """Return only keys accepted by :class:`GlyphEdgeGNN`."""
+    return {k: hparams[k] for k in MODEL_HPARAM_KEYS if k in hparams}
+
+
+def graph_hparams(hparams: dict) -> dict:
+    """Graph construction settings stored alongside model hparams."""
+    return {k: hparams[k] for k in GRAPH_HPARAM_KEYS if k in hparams}

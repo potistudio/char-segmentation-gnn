@@ -90,11 +90,20 @@ def run_export(
     text: str,
     tracking: float,
     cpu: bool,
+    knn: int,
+    radius: float,
+    contour_bridge: float,
 ) -> ExportData:
     cmd = [
         str(infer_bin),
         "--model",
         str(model),
+        "--knn",
+        str(knn),
+        "--radius",
+        str(radius),
+        "--contour-bridge",
+        str(contour_bridge),
         "export",
         "--font",
         str(font),
@@ -134,6 +143,9 @@ class GlyphGuiApp(tk.Tk):
         tracking: float,
         threshold: float,
         cpu: bool,
+        knn: int,
+        radius: float,
+        contour_bridge: float,
     ) -> None:
         super().__init__()
         self.title("Glyph Character Segmentation")
@@ -147,12 +159,16 @@ class GlyphGuiApp(tk.Tk):
         self.tracking_var = tk.DoubleVar(value=tracking)
         self.threshold_var = tk.DoubleVar(value=threshold)
         self.cpu_var = tk.BooleanVar(value=cpu)
+        self.knn_var = tk.IntVar(value=knn)
+        self.radius_var = tk.DoubleVar(value=radius)
+        self.contour_bridge_var = tk.DoubleVar(value=contour_bridge)
         self.show_graph_var = tk.BooleanVar(value=False)
         self.show_edges_var = tk.BooleanVar(value=False)
 
         self._data: ExportData | None = None
         self._busy = False
         self._threshold_job: str | None = None
+        self._graph_job: str | None = None
 
         self._build_controls()
         self._build_canvas()
@@ -217,6 +233,25 @@ class GlyphGuiApp(tk.Tk):
             command=self._on_threshold_change,
         ).pack(side="left", fill="x", expand=True, padx=4)
 
+        graph_row = ttk.Frame(panel)
+        graph_row.pack(fill="x", pady=2)
+        ttk.Label(graph_row, text="Graph", width=12).pack(side="left")
+        ttk.Label(graph_row, text="kNN").pack(side="left", padx=(4, 2))
+        knn_entry = ttk.Spinbox(graph_row, from_=1, to=64, width=5, textvariable=self.knn_var)
+        knn_entry.pack(side="left")
+        knn_entry.bind("<Return>", lambda _e: self._schedule_graph_rerun())
+        knn_entry.bind("<FocusOut>", lambda _e: self._schedule_graph_rerun())
+        ttk.Label(graph_row, text="radius").pack(side="left", padx=(8, 2))
+        radius_entry = ttk.Entry(graph_row, width=6, textvariable=self.radius_var)
+        radius_entry.pack(side="left")
+        radius_entry.bind("<Return>", lambda _e: self._schedule_graph_rerun())
+        radius_entry.bind("<FocusOut>", lambda _e: self._schedule_graph_rerun())
+        ttk.Label(graph_row, text="bridge").pack(side="left", padx=(8, 2))
+        bridge_entry = ttk.Entry(graph_row, width=6, textvariable=self.contour_bridge_var)
+        bridge_entry.pack(side="left")
+        bridge_entry.bind("<Return>", lambda _e: self._schedule_graph_rerun())
+        bridge_entry.bind("<FocusOut>", lambda _e: self._schedule_graph_rerun())
+
         opts = ttk.Frame(panel)
         opts.pack(fill="x", pady=2)
         ttk.Checkbutton(opts, text="CPU only", variable=self.cpu_var).pack(side="left", padx=(0, 12))
@@ -265,6 +300,15 @@ class GlyphGuiApp(tk.Tk):
         self._tracking_job = None
         self.run_inference()
 
+    def _schedule_graph_rerun(self) -> None:
+        if self._graph_job is not None:
+            self.after_cancel(self._graph_job)
+        self._graph_job = self.after(300, self._graph_rerun)
+
+    def _graph_rerun(self) -> None:
+        self._graph_job = None
+        self.run_inference()
+
     def _on_threshold_change(self, _value: str) -> None:
         self._update_slider_labels()
         if self._threshold_job is not None:
@@ -310,6 +354,9 @@ class GlyphGuiApp(tk.Tk):
                 text,
                 self.tracking_var.get(),
                 self.cpu_var.get(),
+                int(self.knn_var.get()),
+                float(self.radius_var.get()),
+                float(self.contour_bridge_var.get()),
             )
         except (RuntimeError, json.JSONDecodeError, KeyError) as exc:
             messagebox.showerror("Inference failed", str(exc))
@@ -398,6 +445,8 @@ class GlyphGuiApp(tk.Tk):
 
         self.status_var.set(
             f"{data.num_nodes} nodes | {len(data.edge_prob)} edges | "
+            f"kNN {int(self.knn_var.get())} r {float(self.radius_var.get()):.2f} "
+            f"bridge {float(self.contour_bridge_var.get()):.2f} | "
             f"pre {data.timing_preprocess_ms:.1f}ms | "
             f"inf {data.timing_inference_ms:.1f}ms | threshold {threshold:.2f}"
         )
@@ -412,6 +461,10 @@ def main() -> None:
     ap.add_argument("--text", default="Overlap")
     ap.add_argument("--tracking", type=float, default=-0.12)
     ap.add_argument("--threshold", type=float, default=0.7)
+    ap.add_argument("--knn", type=int, default=8, help="graph kNN (must match training)")
+    ap.add_argument("--radius", type=float, default=0.25, help="graph radius in em (must match training)")
+    ap.add_argument("--contour-bridge", type=float, default=0.35,
+                    help="contour-pair bridge distance in em (must match training)")
     ap.add_argument("--cpu", action="store_true")
     args = ap.parse_args()
 
@@ -424,6 +477,9 @@ def main() -> None:
             tracking=args.tracking,
             threshold=args.threshold,
             cpu=args.cpu,
+            knn=args.knn,
+            radius=args.radius,
+            contour_bridge=args.contour_bridge,
         )
     except tk.TclError as exc:
         print(f"GUI unavailable: {exc}", file=sys.stderr)

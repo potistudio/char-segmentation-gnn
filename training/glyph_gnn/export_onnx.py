@@ -13,7 +13,7 @@ import argparse
 
 import torch
 
-from .model import GlyphEdgeGNN
+from .model import GlyphEdgeGNN, graph_hparams, model_hparams
 
 
 class InferenceWrapper(torch.nn.Module):
@@ -42,13 +42,19 @@ def main() -> None:
     args = ap.parse_args()
 
     ckpt = torch.load(args.checkpoint, map_location="cpu", weights_only=True)
-    model = GlyphEdgeGNN(**ckpt["hparams"])
+    hparams = ckpt["hparams"]
+    model = GlyphEdgeGNN(**model_hparams(hparams))
     model.load_state_dict(ckpt["state_dict"])
     wrapper = InferenceWrapper(model)
     wrapper.eval()
 
-    node_dim = ckpt["hparams"]["node_dim"]
-    edge_dim = ckpt["hparams"]["edge_dim"]
+    graph_cfg = graph_hparams(hparams)
+    if graph_cfg:
+        print(f"graph config in checkpoint: {graph_cfg}")
+        print("pass matching --knn / --radius / --contour-bridge to glyph-infer")
+
+    node_dim = hparams["node_dim"]
+    edge_dim = hparams["edge_dim"]
     dummy = make_dummy_inputs(node_dim, edge_dim)
 
     torch.onnx.export(
