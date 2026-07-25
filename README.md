@@ -171,6 +171,20 @@ cargo run --release -p glyph-infer -- --model model.onnx \
   グループが結合するため高めが安全。12kサンプル学習モデルの実測では
   0.7 が最良: 未学習フォントで誤結合ゼロ・完全グルーピング 94%)
 
+### 5. インタラクティブ GUI
+
+```bash
+cargo build --release -p glyph-infer
+uv sync
+uv run glyph-gui --model model.onnx --font fonts/body/arial.ttf
+```
+
+- フォント輪郭を文字グループごとに色分け表示
+- **Tracking** スライダーで字間を調整(負の値で密着)
+- **Threshold** スライダーで結合閾値をリアルタイム変更(推論は再実行せず Union-Find のみ再計算)
+- グラフノード・エッジのオーバーレイ表示に対応
+- 前処理と ONNX 推論は `glyph-infer export` が JSON を返し、GUI が描画を担当
+
 ### CUDA 実行の要件
 
 - ort は CUDA ≥ 13.2(または ≥ 12.8)+ cuDNN ≥ 9 のバイナリを自動ダウンロード。

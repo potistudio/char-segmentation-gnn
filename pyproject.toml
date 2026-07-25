@@ -12,6 +12,7 @@ dependencies = [
     "onnx>=1.16",
     "onnxruntime>=1.18",
     "tqdm>=4.66",
+    "matplotlib>=3.8",
 ]
 
 [build-system]
@@ -20,6 +21,9 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["training/glyph_gnn"]
+
+[project.scripts]
+glyph-gui = "glyph_gnn.gui:main"
 
 [tool.uv]
 package = true

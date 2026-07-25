@@ -6,6 +6,7 @@
 //!
 //! Preprocessing reuses glyph-core so it is identical to dataset generation.
 
+mod export;
 mod postprocess;
 
 use std::path::PathBuf;
@@ -61,6 +62,16 @@ enum Command {
         /// Max samples to evaluate (0 = all).
         #[arg(long, default_value_t = 0)]
         limit: usize,
+    },
+    /// Run inference and emit JSON for the interactive GUI.
+    Export {
+        #[arg(long)]
+        font: PathBuf,
+        #[arg(long)]
+        text: String,
+        /// Extra tracking in em units (negative squeezes glyphs together).
+        #[arg(long, default_value_t = 0.0, allow_negative_numbers = true)]
+        tracking: f32,
     },
 }
 
@@ -156,6 +167,15 @@ fn main() -> Result<()> {
             tracking,
         } => demo(&mut engine, font, text, *tracking),
         Command::Eval { shard, limit } => eval(&mut engine, shard, *limit),
+        Command::Export {
+            font,
+            text,
+            tracking,
+        } => {
+            let payload = export::run_export(&mut engine, font, text, *tracking)?;
+            println!("{}", serde_json::to_string(&payload)?);
+            Ok(())
+        }
     }
 }
 
