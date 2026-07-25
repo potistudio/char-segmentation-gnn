@@ -68,3 +68,42 @@ fn distant_contours_are_disconnected() {
     // No cross-character edges should exist at this distance.
     assert!(g.edge_labels.iter().all(|&l| l == 1));
 }
+
+#[test]
+fn contour_bridge_links_distant_strokes_of_one_glyph() {
+    let upem = 1000.0;
+    // Two components of one glyph separated enough that kNN does not link them;
+    // a neighbouring glyph sits within bridge range of the right-hand stroke.
+    let contours = vec![
+        ContourInstance {
+            contour: square(0.0, 0.0, 50.0),
+            char_id: 0,
+        },
+        ContourInstance {
+            contour: square(360.0, 0.0, 50.0),
+            char_id: 0,
+        },
+        ContourInstance {
+            contour: square(450.0, 0.0, 50.0),
+            char_id: 1,
+        },
+    ];
+    let no_bridge = GraphConfig {
+        contour_bridge: 0.0,
+        ..GraphConfig::default()
+    };
+    let with_bridge = GraphConfig {
+        contour_bridge: 0.35,
+        ..GraphConfig::default()
+    };
+    let g0 = build_graph(&contours, upem, &no_bridge);
+    let g1 = build_graph(&contours, upem, &with_bridge);
+
+    let pos0 = g0.edge_labels.iter().filter(|&&l| l == 1).count();
+    let pos1 = g1.edge_labels.iter().filter(|&&l| l == 1).count();
+    let neg1 = g1.edge_labels.iter().filter(|&&l| l == 0).count();
+
+    assert!(pos0 < pos1, "bridges should add same-glyph positive edges");
+    assert!(neg1 > 0, "bridges should add cross-glyph negative edges");
+    assert!(g1.num_edges() > g0.num_edges());
+}

@@ -35,6 +35,18 @@ struct Args {
     #[arg(long, default_value_t = 0.5)]
     threshold: f32,
 
+    /// Graph kNN degree (must match training for best results).
+    #[arg(long, default_value_t = 8)]
+    knn: usize,
+
+    /// Graph connection radius in em units (must match training for best results).
+    #[arg(long, default_value_t = 0.25)]
+    radius: f32,
+
+    /// Contour-pair bridge distance in em units (must match training for best results).
+    #[arg(long, default_value_t = 0.35)]
+    contour_bridge: f32,
+
     /// Force CPU execution (skip the CUDA execution provider).
     #[arg(long)]
     cpu: bool,
@@ -156,30 +168,46 @@ impl Engine {
     }
 }
 
+fn graph_config(knn: usize, radius: f32, contour_bridge: f32) -> GraphConfig {
+    GraphConfig {
+        knn,
+        radius,
+        contour_bridge,
+        ..GraphConfig::default()
+    }
+}
+
 fn main() -> Result<()> {
     let args = Args::parse();
     let mut engine = Engine::new(&args.model, !args.cpu, args.threshold)?;
+    let graph_cfg = graph_config(args.knn, args.radius, args.contour_bridge);
 
     match &args.cmd {
         Command::Demo {
             font,
             text,
             tracking,
-        } => demo(&mut engine, font, text, *tracking),
+        } => demo(&mut engine, font, text, *tracking, &graph_cfg),
         Command::Eval { shard, limit } => eval(&mut engine, shard, *limit),
         Command::Export {
             font,
             text,
             tracking,
         } => {
-            let payload = export::run_export(&mut engine, font, text, *tracking)?;
+            let payload = export::run_export(&mut engine, font, text, *tracking, &graph_cfg)?;
             println!("{}", serde_json::to_string(&payload)?);
             Ok(())
         }
     }
 }
 
-fn demo(engine: &mut Engine, font: &PathBuf, text: &str, tracking: f32) -> Result<()> {
+fn demo(
+    engine: &mut Engine,
+    font: &PathBuf,
+    text: &str,
+    tracking: f32,
+    graph_cfg: &GraphConfig,
+) -> Result<()> {
     let font_data = std::fs::read(font)?;
     let mut rng = Pcg64Mcg::seed_from_u64(0);
     let layout_cfg = LayoutConfig {
@@ -191,7 +219,7 @@ fn demo(engine: &mut Engine, font: &PathBuf, text: &str, tracking: f32) -> Resul
     let t0 = Instant::now();
     let (contours, upem) =
         layout_text(&font_data, text, &layout_cfg, &mut rng).context("layout failed")?;
-    let graph = build_graph(&contours, upem, &GraphConfig::default());
+    let graph = build_graph(&contours, upem, graph_cfg);
     let t_pre = t0.elapsed();
 
     // --- inference ---

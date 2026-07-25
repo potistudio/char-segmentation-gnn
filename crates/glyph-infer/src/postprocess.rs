@@ -21,7 +21,6 @@ impl UnionFind {
         while self.parent[root as usize] != root {
             root = self.parent[root as usize];
         }
-        // Path compression.
         let mut cur = x;
         while self.parent[cur as usize] != root {
             let next = self.parent[cur as usize];
@@ -41,45 +40,52 @@ impl UnionFind {
 
 /// Groups contours into character segments.
 ///
-/// Nodes joined by edges whose probability clears `threshold` are merged
-/// with union-find. Each contour is then assigned to the component that
-/// holds the majority of its nodes (individual noisy nodes cannot split a
-/// contour), and contours sharing a component form one character.
+/// Cross-contour edges are aggregated by max probability per contour pair.
+/// Contours whose pair score clears `threshold` are merged with union-find.
+/// Each contour is an atomic unit (intra-contour connectivity is implicit).
 ///
 /// Returns contour-id groups sorted by leftmost node for stable output.
 pub fn group_characters(g: &GraphSample, probs: &[f32], threshold: f32) -> Vec<Vec<u32>> {
     let n = g.num_nodes as usize;
+    if n == 0 {
+        return Vec::new();
+    }
     let e = g.num_edges();
-    let mut uf = UnionFind::new(n);
+    let num_contours = g
+        .node_contour_ids
+        .iter()
+        .copied()
+        .max()
+        .map(|m| m + 1)
+        .unwrap_or(0) as usize;
     let (src, dst) = g.edge_index.split_at(e);
+
+    let mut pair_prob: HashMap<(u32, u32), f32> = HashMap::new();
     for i in 0..e {
-        if probs[i] >= threshold {
-            uf.union(src[i], dst[i]);
+        let ca = g.node_contour_ids[src[i] as usize];
+        let cb = g.node_contour_ids[dst[i] as usize];
+        if ca == cb {
+            continue;
+        }
+        let key = if ca < cb { (ca, cb) } else { (cb, ca) };
+        let entry = pair_prob.entry(key).or_insert(0.0);
+        if probs[i] > *entry {
+            *entry = probs[i];
         }
     }
 
-    // Majority vote: contour -> component.
-    let mut votes: HashMap<(u32, u32), u32> = HashMap::new();
-    for node in 0..n as u32 {
-        let comp = uf.find(node);
-        let contour = g.node_contour_ids[node as usize];
-        *votes.entry((contour, comp)).or_insert(0) += 1;
-    }
-    let mut contour_comp: HashMap<u32, (u32, u32)> = HashMap::new();
-    for (&(contour, comp), &count) in &votes {
-        let entry = contour_comp.entry(contour).or_insert((comp, 0));
-        if count > entry.1 {
-            *entry = (comp, count);
+    let mut uf = UnionFind::new(num_contours);
+    for (&(a, b), &prob) in &pair_prob {
+        if prob >= threshold {
+            uf.union(a, b);
         }
     }
 
-    // Component -> contour list.
     let mut groups: HashMap<u32, Vec<u32>> = HashMap::new();
-    for (&contour, &(comp, _)) in &contour_comp {
-        groups.entry(comp).or_default().push(contour);
+    for contour in 0..num_contours as u32 {
+        groups.entry(uf.find(contour)).or_default().push(contour);
     }
 
-    // Sort each group and order groups by leftmost x for readability.
     let node_dim = g.node_dim as usize;
     let contour_min_x = |cids: &[u32]| -> f32 {
         let mut min_x = f32::INFINITY;

@@ -95,6 +95,7 @@ pub fn run_export(
     font: &Path,
     text: &str,
     tracking: f32,
+    graph_cfg: &GraphConfig,
 ) -> Result<ExportPayload> {
     let font_data = std::fs::read(font)?;
     let mut rng = Pcg64Mcg::seed_from_u64(0);
@@ -105,7 +106,7 @@ pub fn run_export(
 
     let t0 = std::time::Instant::now();
     let (contours, upem) = layout_text(&font_data, text, &layout_cfg, &mut rng)?;
-    let graph = build_graph(&contours, upem, &GraphConfig::default());
+    let graph = build_graph(&contours, upem, graph_cfg);
     let t_pre = t0.elapsed();
 
     let t1 = std::time::Instant::now();

@@ -14,7 +14,11 @@ def group_characters(
     threshold: float,
 ) -> list[list[int]]:
     """Groups contours into character segments from thresholded edge probabilities."""
-    parent = list(range(num_nodes))
+    if not node_contour_ids:
+        return []
+
+    num_contours = max(node_contour_ids) + 1
+    parent = list(range(num_contours))
 
     def find(x: int) -> int:
         root = x
@@ -31,25 +35,24 @@ def group_characters(
         if ra != rb:
             parent[ra] = rb
 
+    pair_prob: dict[tuple[int, int], float] = {}
     for src, dst, prob in zip(edge_src, edge_dst, probs, strict=True):
+        ca = node_contour_ids[src]
+        cb = node_contour_ids[dst]
+        if ca == cb:
+            continue
+        key = (min(ca, cb), max(ca, cb))
+        prev = pair_prob.get(key, 0.0)
+        if prob > prev:
+            pair_prob[key] = prob
+
+    for (a, b), prob in pair_prob.items():
         if prob >= threshold:
-            union(src, dst)
-
-    votes: dict[tuple[int, int], int] = defaultdict(int)
-    for node in range(num_nodes):
-        comp = find(node)
-        contour = node_contour_ids[node]
-        votes[(contour, comp)] += 1
-
-    contour_comp: dict[int, tuple[int, int]] = {}
-    for (contour, comp), count in votes.items():
-        best_comp, best_count = contour_comp.get(contour, (comp, 0))
-        if count > best_count:
-            contour_comp[contour] = (comp, count)
+            union(a, b)
 
     groups_map: dict[int, list[int]] = defaultdict(list)
-    for contour, (comp, _) in contour_comp.items():
-        groups_map[comp].append(contour)
+    for contour in range(num_contours):
+        groups_map[find(contour)].append(contour)
 
     return [sorted(contours) for contours in groups_map.values()]
 

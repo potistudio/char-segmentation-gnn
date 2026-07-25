@@ -79,6 +79,10 @@ struct Args {
     #[arg(long, default_value_t = 0.25)]
     radius: f32,
 
+    /// Graph construction: bridge closest node pair per contour pair within this distance (em).
+    #[arg(long, default_value_t = 0.35)]
+    contour_bridge: f32,
+
     /// Contour resampling spacing in em units.
     #[arg(long, default_value_t = 0.05)]
     spacing: f32,
@@ -235,6 +239,7 @@ fn main() -> Result<()> {
         },
         knn: args.knn,
         radius: args.radius,
+        contour_bridge: args.contour_bridge,
     };
 
     fs::create_dir_all(&args.out)?;

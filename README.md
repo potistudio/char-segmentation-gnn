@@ -59,7 +59,11 @@ cargo run --release -p dataset-gen -- \
 - 本文フォント:装飾フォント = 7:3(`--deco-ratio` で変更可)
 - データ拡張: 負のトラッキング(パス交差の生成)、ベースライン上下動、
   アスペクト比変更、ポイントノイズ
-- `--knn` / `--radius` / `--spacing` でグラフ構築パラメータを調整
+- `--knn` / `--radius` / `--contour-bridge` / `--spacing` でグラフ構築パラメータを調整
+- **推論時は学習時と同じ** `--knn` / `--radius` / `--contour-bridge` を指定すること
+  (`glyph-infer` と `dataset-gen` の既定は knn=8, radius=0.25, contour-bridge=0.35)
+- 既存の `dataset/ja-train` や `model.onnx` は `contour_bridge=0` で生成されている。
+  ブリッジエッジを有効にするにはデータセットの再生成と再学習が必要
 
 ### 2. 学習(フェーズ2)
 
@@ -215,7 +219,9 @@ PATH=".venv/Lib/site-packages/torch/lib:$PATH" \
 
 - ノード = 輪郭を弧長等間隔でリサンプリングした点
   (座標・接線・重心オフセット・輪郭重心・バウンディングボックス・弧長・輪郭位相)
-- エッジ = KD木による半径つき kNN(既定: k=8, r=0.25em)、無向(双方向格納)
+- エッジ = KD木による半径つき kNN(既定: k=8, r=0.25em) + 輪郭ペアのブリッジエッジ
+  (各輪郭の最近接点を `contour_bridge` 以内で接続。kNN 上限で同一文字の遠い
+  ストロークが繋がらない問題を解消)、無向(双方向格納)
 - ラベル = 両端ノードが同一文字(シェーピングクラスタ)に属するか
 
 ## 日本語対応

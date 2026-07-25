@@ -35,6 +35,11 @@ pub struct GraphConfig {
     pub knn: usize,
     /// Connection radius in normalized units (1.0 == upem).
     pub radius: f32,
+    /// For each contour pair, connect the closest node pair when their
+    /// distance is within this limit (em). kNN caps can block intra-glyph
+    /// stroke links even when points are within [`radius`]; bridges ensure
+    /// every nearby contour pair is scored by the model.
+    pub contour_bridge: f32,
 }
 
 impl Default for GraphConfig {
@@ -43,6 +48,7 @@ impl Default for GraphConfig {
             sample: SampleConfig::default(),
             knn: 8,
             radius: 0.25,
+            contour_bridge: 0.35,
         }
     }
 }
@@ -175,6 +181,40 @@ pub fn build_graph(contours: &[ContourInstance], upem: f32, cfg: &GraphConfig) -
                 }
                 let (a, b) = if i < j { (i, j) } else { (j, i) };
                 pairs.insert((a as u32, b as u32));
+            }
+        }
+    }
+
+    // Bridge edges: one closest-node link per contour pair within contour_bridge.
+    // kNN caps often omit these when dense local neighbours fill the budget.
+    if cfg.contour_bridge > 0.0 {
+        let contour_count = pending.len();
+        let mut contour_nodes: Vec<Vec<usize>> = vec![Vec::new(); contour_count];
+        for (i, n) in nodes.iter().enumerate() {
+            contour_nodes[n.contour_id as usize].push(i);
+        }
+        let bridge_sq = cfg.contour_bridge * cfg.contour_bridge;
+        for ca in 0..contour_count {
+            for cb in (ca + 1)..contour_count {
+                let mut best_dist_sq = f32::INFINITY;
+                let mut best_pair: Option<(usize, usize)> = None;
+                for &i in &contour_nodes[ca] {
+                    for &j in &contour_nodes[cb] {
+                        let dx = nodes[j].pos[0] - nodes[i].pos[0];
+                        let dy = nodes[j].pos[1] - nodes[i].pos[1];
+                        let d2 = dx * dx + dy * dy;
+                        if d2 < best_dist_sq {
+                            best_dist_sq = d2;
+                            best_pair = Some((i, j));
+                        }
+                    }
+                }
+                if best_dist_sq <= bridge_sq {
+                    if let Some((i, j)) = best_pair {
+                        let (a, b) = if i < j { (i, j) } else { (j, i) };
+                        pairs.insert((a as u32, b as u32));
+                    }
+                }
             }
         }
     }

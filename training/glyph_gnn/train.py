@@ -149,6 +149,10 @@ def main() -> None:
                     help="read the packed store sequentially first; on a spinning disk"
                          " this is far cheaper than faulting it in at random")
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--knn", type=int, default=8, help="graph kNN used when generating training data")
+    ap.add_argument("--radius", type=float, default=0.25, help="graph radius (em) used when generating training data")
+    ap.add_argument("--contour-bridge", type=float, default=0.35,
+                    help="contour-pair bridge distance (em) used when generating training data")
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     ap.add_argument("--no-progress", action="store_true", help="disable progress bars")
     args = ap.parse_args()
@@ -195,6 +199,11 @@ def main() -> None:
     model = GlyphEdgeGNN(
         hidden=args.hidden, layers=args.layers, heads=args.heads, dropout=args.dropout
     ).to(device)
+    model.hparams.update(
+        knn=args.knn,
+        radius=args.radius,
+        contour_bridge=args.contour_bridge,
+    )
     optim = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(optim, T_max=args.epochs)
 
