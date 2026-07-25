@@ -11,10 +11,9 @@ import time
 from pathlib import Path
 
 import torch
-from torch_geometric.loader import DataLoader
 from tqdm.auto import tqdm
 
-from .dataset import load_dataset
+from .dataset import load_dataset, make_loader
 from .loss import focal_loss
 from .model import GlyphEdgeGNN
 
@@ -63,7 +62,8 @@ def print_run_summary(args, model, train_stats, val_stats, steps_per_epoch) -> N
         f" | cosine annealing T_max {args.epochs}"
     )
     schedule_row = (
-        f"{args.epochs} epochs | batch {args.batch_size} | {steps_per_epoch:,} steps/epoch"
+        f"{args.epochs} epochs | batch <= {args.batch_size} graphs"
+        f" / {args.max_edges_per_batch:,} edges | {steps_per_epoch:,} steps/epoch"
     )
     rows = [
         ("device", device_label),
@@ -86,6 +86,12 @@ def print_run_summary(args, model, train_stats, val_stats, steps_per_epoch) -> N
     print("=" * width)
 
 
+def release(device) -> None:
+    """Drops the allocator's cached blocks after an out-of-memory batch."""
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
+
+
 @torch.no_grad()
 def evaluate(model, loader, device, threshold: float = 0.5, alpha: float = 0.25,
              gamma: float = 2.0, progress: bool = True) -> dict:
@@ -97,8 +103,14 @@ def evaluate(model, loader, device, threshold: float = 0.5, alpha: float = 0.25,
                disable=None if progress else True)
     for batch in bar:
         batch = batch.to(device)
-        logits = model(batch.x, batch.edge_index, batch.edge_attr)
-        total_loss += focal_loss(logits, batch.y, alpha=alpha, gamma=gamma).item() * batch.num_graphs
+        try:
+            logits = model(batch.x, batch.edge_index, batch.edge_attr)
+            loss = focal_loss(logits, batch.y, alpha=alpha, gamma=gamma)
+        except torch.OutOfMemoryError:
+            batch = logits = loss = None
+            release(device)
+            continue
+        total_loss += loss.item() * batch.num_graphs
         graphs += batch.num_graphs
         pred = (torch.sigmoid(logits) >= threshold).float()
         y = batch.y
@@ -123,7 +135,9 @@ def main() -> None:
     ap.add_argument("--data", required=True, help="directory of .msgpack shards")
     ap.add_argument("--out", default="checkpoints/run")
     ap.add_argument("--epochs", type=int, default=30)
-    ap.add_argument("--batch-size", type=int, default=64)
+    ap.add_argument("--batch-size", type=int, default=64, help="max graphs per batch")
+    ap.add_argument("--max-edges-per-batch", type=int, default=200_000,
+                    help="max edges per batch; lower this if the GPU runs out of memory")
     ap.add_argument("--lr", type=float, default=3e-4)
     ap.add_argument("--weight-decay", type=float, default=1e-4)
     ap.add_argument("--hidden", type=int, default=128)
@@ -153,8 +167,9 @@ def main() -> None:
         progress=progress,
     )
 
-    train_loader = DataLoader(train_set, batch_size=args.batch_size, shuffle=True)
-    val_loader = DataLoader(val_set, batch_size=args.batch_size)
+    train_loader = make_loader(train_set, args.max_edges_per_batch, args.batch_size,
+                               shuffle=True, seed=args.seed)
+    val_loader = make_loader(val_set, args.max_edges_per_batch, args.batch_size)
 
     model = GlyphEdgeGNN(
         hidden=args.hidden, layers=args.layers, heads=args.heads, dropout=args.dropout
@@ -178,15 +193,25 @@ def main() -> None:
         t0 = time.time()
         total_loss = 0.0
         seen = 0
+        skipped = 0
         lr = optim.param_groups[0]["lr"]
         batches = tqdm(train_loader, desc=f"  epoch {epoch}/{args.epochs}", unit="batch",
                        leave=False, disable=None if progress else True)
         for batch in batches:
             batch = batch.to(device)
-            optim.zero_grad()
-            logits = model(batch.x, batch.edge_index, batch.edge_attr)
-            loss = focal_loss(logits, batch.y, alpha=args.focal_alpha, gamma=args.focal_gamma)
-            loss.backward()
+            optim.zero_grad(set_to_none=True)
+            try:
+                logits = model(batch.x, batch.edge_index, batch.edge_attr)
+                loss = focal_loss(logits, batch.y, alpha=args.focal_alpha,
+                                  gamma=args.focal_gamma)
+                loss.backward()
+            except torch.OutOfMemoryError:
+                # One oversized batch should not kill a multi-hour run.
+                optim.zero_grad(set_to_none=True)
+                batch = logits = loss = None
+                release(device)
+                skipped += 1
+                continue
             grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optim.step()
             total_loss += loss.detach().item() * batch.num_graphs
@@ -194,6 +219,9 @@ def main() -> None:
             batches.set_postfix(loss=f"{total_loss / seen:.4f}", lr=f"{lr:.2e}",
                                 grad=f"{float(grad_norm):.2f}", refresh=False)
         batches.close()
+        if skipped:
+            tqdm.write(f"epoch {epoch:3d}: skipped {skipped} batch(es) after CUDA OOM;"
+                       " lower --max-edges-per-batch")
         sched.step()
 
         metrics = evaluate(model, val_loader, device, alpha=args.focal_alpha,
@@ -213,6 +241,9 @@ def main() -> None:
 
         line = (f"epoch {epoch:3d}/{args.epochs} | loss {avg_loss:.4f} | lr {lr:.2e}"
                 f" | {format_duration(elapsed)} | {seen / max(elapsed, 1e-9):.0f} graphs/s")
+        if device.type == "cuda":
+            line += f" | peak {torch.cuda.max_memory_allocated(device) / 2**30:.1f}GiB"
+            torch.cuda.reset_peak_memory_stats(device)
         if metrics:
             line += (
                 f" | val loss {metrics['loss']:.4f} P {metrics['precision']:.4f}"

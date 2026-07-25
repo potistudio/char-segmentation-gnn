@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 import random
+from collections.abc import Iterator, Sequence
 from pathlib import Path
 
 import msgpack
 import torch
+from torch.utils.data import Sampler
 from torch_geometric.data import Data
+from torch_geometric.loader import DataLoader
 from tqdm.auto import tqdm
 
 
@@ -74,3 +77,79 @@ def load_dataset(
         n_val = int(len(graphs) * val_frac)
         val, train = graphs[:n_val], graphs[n_val:]
     return train, val
+
+
+class EdgeBudgetBatchSampler(Sampler[list[int]]):
+    """Groups graphs into batches bounded by a total edge count.
+
+    Every activation in the GAT layers is shaped ``[num_edges, hidden]``, so
+    peak memory tracks the edge count of a batch, not the graph count. Glyph
+    graphs range from ~1k to ~24k edges, so a fixed ``batch_size`` makes peak
+    memory swing by more than an order of magnitude and the largest batches
+    blow up the GPU. Capping edges per batch keeps it flat.
+    """
+
+    def __init__(
+        self,
+        edge_counts: Sequence[int],
+        max_edges: int,
+        max_graphs: int,
+        shuffle: bool = False,
+        seed: int = 0,
+    ):
+        self.edge_counts = list(edge_counts)
+        self.max_edges = max_edges
+        self.max_graphs = max_graphs
+        self.shuffle = shuffle
+        self.seed = seed
+        self.epoch = 0
+        self.batches = self._pack(range(len(self.edge_counts)))
+
+    def _pack(self, order) -> list[list[int]]:
+        batches: list[list[int]] = []
+        current: list[int] = []
+        edges = 0
+        for i in order:
+            count = self.edge_counts[i]
+            full = len(current) >= self.max_graphs or edges + count > self.max_edges
+            if current and full:
+                batches.append(current)
+                current, edges = [], 0
+            current.append(i)
+            edges += count
+        if current:
+            batches.append(current)
+        return batches
+
+    def __iter__(self) -> Iterator[list[int]]:
+        if self.shuffle:
+            rng = random.Random(self.seed + self.epoch)
+            order = list(range(len(self.edge_counts)))
+            rng.shuffle(order)
+            self.batches = self._pack(order)
+            rng.shuffle(self.batches)
+            self.epoch += 1
+        yield from self.batches
+
+    def __len__(self) -> int:
+        # Reshuffling repacks the batches, so this can drift by a batch or two
+        # between epochs; it is only used for progress reporting.
+        return len(self.batches)
+
+
+def make_loader(
+    graphs: Sequence[Data],
+    max_edges: int,
+    max_graphs: int,
+    shuffle: bool = False,
+    seed: int = 0,
+) -> DataLoader:
+    """Builds a loader whose batches stay within ``max_edges``."""
+    sampler = EdgeBudgetBatchSampler(
+        [int(g.y.numel()) for g in graphs],
+        max_edges=max_edges,
+        max_graphs=max_graphs,
+        shuffle=shuffle,
+        seed=seed,
+    )
+    return DataLoader(graphs, batch_sampler=sampler)
