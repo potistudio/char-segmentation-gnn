@@ -33,6 +33,34 @@ import torch
 DEFAULT_THRESHOLDS = (0.3, 0.4, 0.5, 0.6, 0.65, 0.7, 0.75, 0.8, 0.85, 0.9)
 
 
+def contour_pair_index(contour_id: torch.Tensor, edge_index: torch.Tensor):
+    """Maps each point edge onto the contour pair it votes on.
+
+    Returns ``(inter, inverse, keys, stride)``: ``inter`` masks the edges that
+    cross contours, ``inverse`` gives each of those the index of its undirected
+    contour pair, and ``keys`` encodes the pair as ``lo * stride + hi``. Both
+    stored directions of an edge collapse onto the same pair, matching what
+    ``postprocess.rs`` aggregates over.
+
+    Shared by the metrics and the pair-level loss so the two cannot drift.
+    """
+    src, dst = edge_index[0], edge_index[1]
+    ca, cb = contour_id[src], contour_id[dst]
+    inter = ca != cb
+    stride = max(int(contour_id.max()) + 1 if contour_id.numel() else 1, 1)
+    lo = torch.minimum(ca, cb)[inter]
+    hi = torch.maximum(ca, cb)[inter]
+    keys, inverse = torch.unique(lo * stride + hi, return_inverse=True)
+    return inter, inverse, keys, stride
+
+
+def scatter_amax(values: torch.Tensor, index: torch.Tensor, size: int) -> torch.Tensor:
+    """Per-bin maximum, the reduction ``group_characters`` applies to pairs."""
+    return values.new_zeros(size).scatter_reduce_(
+        0, index, values, reduce="amax", include_self=False
+    )
+
+
 def _components(num_contours: int, a: np.ndarray, b: np.ndarray) -> np.ndarray:
     """Union-find over contour pairs, mirroring ``postprocess.rs``.
 
@@ -100,25 +128,15 @@ class GroupingEvaluator:
         contour_char = contour_id.new_zeros(num_contours).scatter_(0, contour_id, char_id)
         contour_graph = contour_id.new_zeros(num_contours).scatter_(0, contour_id, batch.batch)
 
-        src, dst = batch.edge_index[0], batch.edge_index[1]
-        ca, cb = contour_id[src], contour_id[dst]
-        inter = ca != cb
-        lo = torch.minimum(ca, cb)[inter]
-        hi = torch.maximum(ca, cb)[inter]
-
         # One row per undirected contour pair; both stored directions and every
         # point edge between the two contours collapse into it by max, exactly
         # as postprocess.rs does.
-        keys, inverse = torch.unique(lo * max(num_contours, 1) + hi, return_inverse=True)
-        pair_prob = probs.new_zeros(keys.numel()).scatter_reduce_(
-            0, inverse, probs[inter].float(), reduce="amax", include_self=False
-        )
-        pair_label = probs.new_zeros(keys.numel()).scatter_reduce_(
-            0, inverse, batch.y[inter].float(), reduce="amax", include_self=False
-        )
+        inter, inverse, keys, stride = contour_pair_index(contour_id, batch.edge_index)
+        pair_prob = scatter_amax(probs[inter].float(), inverse, keys.numel())
+        pair_label = scatter_amax(batch.y[inter].float(), inverse, keys.numel())
 
-        self._a.append((keys // max(num_contours, 1)).cpu().numpy() + self._contour_base)
-        self._b.append((keys % max(num_contours, 1)).cpu().numpy() + self._contour_base)
+        self._a.append((keys // stride).cpu().numpy() + self._contour_base)
+        self._b.append((keys % stride).cpu().numpy() + self._contour_base)
         self._prob.append(pair_prob.cpu().numpy())
         self._label.append(pair_label.cpu().numpy())
         self._contour_char.append(contour_char.cpu().numpy() + self._char_base)

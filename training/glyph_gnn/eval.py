@@ -14,7 +14,9 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import sys
 from collections import defaultdict
+from unicodedata import east_asian_width
 
 import torch
 from tqdm.auto import tqdm
@@ -47,6 +49,15 @@ def run(model, loader, device, progress: bool = True) -> GroupingEvaluator:
     return grouping
 
 
+def display_width(text: str) -> int:
+    """Terminal columns a string occupies.
+
+    Kana and kanji are double width, so padding by ``len`` leaves the table
+    ragged in exactly the runs worth reading.
+    """
+    return sum(2 if east_asian_width(c) in "WF" else 1 for c in text)
+
+
 def breakdown(grouping: GroupingEvaluator, threshold: float, top: int) -> str:
     """Per-text grouping accuracy, worst first."""
     scored = grouping.score(threshold, per_graph=True)
@@ -60,18 +71,32 @@ def breakdown(grouping: GroupingEvaluator, threshold: float, top: int) -> str:
         tally[text][1] += int(ok)
 
     rows = sorted(tally.items(), key=lambda kv: (kv[1][1] / kv[1][0], -kv[1][0]))
-    width = max((len(t) for t, _ in rows[:top]), default=4)
+    width = max((display_width(t) for t, _ in rows[:top]), default=4)
     width = max(width, 4)
     lines = [f"{'text':<{width}} {'n':>6} {'correct':>8} {'acc':>8}",
              "-" * (width + 25)]
     for text, (total, ok) in rows[:top]:
-        lines.append(f"{text:<{width}} {total:>6} {ok:>8} {ok / total:>8.4f}")
+        pad = " " * (width - display_width(text))
+        lines.append(f"{text}{pad} {total:>6} {ok:>8} {ok / total:>8.4f}")
     if len(rows) > top:
         lines.append(f"... {len(rows) - top} more patterns")
     return "\n".join(lines)
 
 
+def use_utf8_stdout() -> None:
+    """Print the dataset's own text without mangling or crashing.
+
+    This is the one tool that echoes characters straight out of the corpus.
+    A redirected stdout on Windows defaults to cp932 here, which garbles the
+    breakdown when it lands in a file and raises UnicodeEncodeError outright on
+    any character outside the code page -- exactly the kanji worth inspecting.
+    """
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+
+
 def main() -> None:
+    use_utf8_stdout()
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--checkpoint", required=True)
     ap.add_argument("--data", required=True, help="msgpack shard directory or packed store")

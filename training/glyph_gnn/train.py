@@ -19,10 +19,22 @@ import torch
 from tqdm.auto import tqdm
 
 from .dataset import graph_stats, load_dataset, load_packed, make_loader
-from .loss import focal_loss
+from .loss import glyph_loss
 from .metrics import DEFAULT_THRESHOLDS, GroupingEvaluator, format_sweep
 from .model import GlyphEdgeGNN
 from .pack import is_packed
+
+
+def loss_settings(args) -> dict:
+    """Bundles the loss hyperparameters shared by training and validation."""
+    return dict(
+        alpha=args.focal_alpha,
+        gamma=args.focal_gamma,
+        pair_weight=args.pair_loss_weight,
+        pair_alpha=args.pair_focal_alpha,
+        intra_weight=args.intra_edge_weight,
+        temperature=args.pair_temperature,
+    )
 
 
 def format_duration(seconds: float) -> str:
@@ -72,7 +84,12 @@ def print_run_summary(args, model, train_stats, val_stats, steps_per_epoch,
         ("val", val_row),
         ("model", model_row),
         ("optimizer", optim_row),
-        ("loss", f"focal alpha {args.focal_alpha} gamma {args.focal_gamma} (point edges)"),
+        ("loss", f"focal gamma {args.focal_gamma} |"
+                 f" point edges alpha {args.focal_alpha}"
+                 f" (intra x{args.intra_edge_weight})"
+                 f" {1 - args.pair_loss_weight:.2f} :"
+                 f" {args.pair_loss_weight:.2f} contour pairs"
+                 f" alpha {args.pair_focal_alpha} (T {args.pair_temperature})"),
         ("select", "exact grouping accuracy over contour groups, best of"
                    f" {len(thresholds)} thresholds"),
         ("schedule", schedule_row),
@@ -95,7 +112,7 @@ def release(device) -> None:
 
 
 @torch.no_grad()
-def evaluate(model, loader, device, alpha: float = 0.25, gamma: float = 2.0,
+def evaluate(model, loader, device, settings: dict,
              thresholds=DEFAULT_THRESHOLDS, progress: bool = True) -> dict:
     """Runs one validation pass and scores it at every threshold.
 
@@ -115,7 +132,8 @@ def evaluate(model, loader, device, alpha: float = 0.25, gamma: float = 2.0,
         batch = batch.to(device)
         try:
             logits = model(batch.x, batch.edge_index, batch.edge_attr)
-            loss = focal_loss(logits, batch.y, alpha=alpha, gamma=gamma)
+            loss, _ = glyph_loss(logits, batch.y, batch.contour_id, batch.edge_index,
+                                 **settings)
         except torch.OutOfMemoryError:
             batch = logits = loss = None
             release(device)
@@ -155,8 +173,22 @@ def main() -> None:
     ap.add_argument("--layers", type=int, default=4)
     ap.add_argument("--heads", type=int, default=4)
     ap.add_argument("--dropout", type=float, default=0.1)
-    ap.add_argument("--focal-alpha", type=float, default=0.25)
+    ap.add_argument("--focal-alpha", type=float, default=0.25,
+                    help="positive-class weight for the point-edge term")
     ap.add_argument("--focal-gamma", type=float, default=2.0)
+    ap.add_argument("--pair-loss-weight", type=float, default=0.5,
+                    help="share of the loss taken by the pooled contour-pair term;"
+                         " 0 reproduces the point-only objective")
+    ap.add_argument("--pair-focal-alpha", type=float, default=0.5,
+                    help="positive-class weight for the pair term. Pairs run far"
+                         " closer to balanced than point edges do, and the ratio"
+                         " differs by script -- read it off glyph_gnn.analyze")
+    ap.add_argument("--intra-edge-weight", type=float, default=0.05,
+                    help="weight on intra-contour edges, which are always positive"
+                         " and free to predict; 0 drops them from the loss")
+    ap.add_argument("--pair-temperature", type=float, default=1.0,
+                    help="pooling temperature; approaches inference's hard max as"
+                         " it approaches 0")
     ap.add_argument("--thresholds", default=None,
                     help="comma-separated grouping thresholds to sweep each epoch"
                          f" (default {','.join(str(t) for t in DEFAULT_THRESHOLDS)})")
@@ -183,6 +215,7 @@ def main() -> None:
     device = torch.device(args.device)
     thresholds = (tuple(float(t) for t in args.thresholds.split(","))
                   if args.thresholds else DEFAULT_THRESHOLDS)
+    settings = loss_settings(args)
 
     packed = is_packed(args.data)
     if packed:
@@ -251,13 +284,14 @@ def main() -> None:
         lr = optim.param_groups[0]["lr"]
         batches = tqdm(train_loader, desc=f"  epoch {epoch}/{args.epochs}", unit="batch",
                        leave=False, disable=None if progress else True)
+        parts = {"point": 0.0, "pair": 0.0}
         for batch in batches:
             batch = batch.to(device)
             optim.zero_grad(set_to_none=True)
             try:
                 logits = model(batch.x, batch.edge_index, batch.edge_attr)
-                loss = focal_loss(logits, batch.y, alpha=args.focal_alpha,
-                                  gamma=args.focal_gamma)
+                loss, terms = glyph_loss(logits, batch.y, batch.contour_id,
+                                         batch.edge_index, **settings)
                 loss.backward()
             except torch.OutOfMemoryError:
                 # One oversized batch should not kill a multi-hour run.
@@ -269,6 +303,8 @@ def main() -> None:
             grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optim.step()
             total_loss += loss.detach().item() * batch.num_graphs
+            for key, value in terms.items():
+                parts[key] += value * batch.num_graphs
             seen += batch.num_graphs
             batches.set_postfix(loss=f"{total_loss / seen:.4f}", lr=f"{lr:.2e}",
                                 grad=f"{float(grad_norm):.2f}", refresh=False)
@@ -278,9 +314,8 @@ def main() -> None:
                        " lower --max-edges-per-batch")
         sched.step()
 
-        metrics = evaluate(model, val_loader, device, alpha=args.focal_alpha,
-                           gamma=args.focal_gamma, thresholds=thresholds,
-                           progress=progress) if val_set else {}
+        metrics = evaluate(model, val_loader, device, settings, thresholds,
+                           progress) if val_set else {}
         avg_loss = total_loss / max(seen, 1)
         elapsed = time.time() - t0
 
@@ -290,11 +325,13 @@ def main() -> None:
             best_score, best_epoch = score, epoch
             torch.save(
                 {"state_dict": model.state_dict(), "hparams": model.hparams, "epoch": epoch,
-                 "metrics": metrics},
+                 "metrics": metrics, "loss_settings": settings},
                 out_dir / "best.pt",
             )
 
-        line = (f"epoch {epoch:3d}/{args.epochs} | loss {avg_loss:.4f} | lr {lr:.2e}"
+        line = (f"epoch {epoch:3d}/{args.epochs} | loss {avg_loss:.4f}"
+                f" (pt {parts['point'] / max(seen, 1):.4f}"
+                f" pr {parts['pair'] / max(seen, 1):.4f}) | lr {lr:.2e}"
                 f" | {format_duration(elapsed)} | {seen / max(elapsed, 1e-9):.0f} graphs/s")
         if device.type == "cuda":
             line += f" | peak {torch.cuda.max_memory_allocated(device) / 2**30:.1f}GiB"
@@ -317,7 +354,8 @@ def main() -> None:
         print(format_sweep(metrics["sweep"]))
 
     torch.save(
-        {"state_dict": model.state_dict(), "hparams": model.hparams, "epoch": args.epochs},
+        {"state_dict": model.state_dict(), "hparams": model.hparams,
+         "epoch": args.epochs, "loss_settings": settings},
         out_dir / "last.pt",
     )
     print(f"\nfinished {args.epochs} epochs in {format_duration(time.time() - started)}")

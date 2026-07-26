@@ -1,13 +1,19 @@
 """Self-test for the grouping metrics, run against a real shard.
 
-:mod:`glyph_gnn.metrics` is what selects ``best.pt``, so if it drifts from the
-postprocessor that ships, every later measurement is wrong while still looking
-plausible. This checks it two ways:
+:mod:`glyph_gnn.metrics` is what selects ``best.pt`` and :mod:`glyph_gnn.loss`
+is what the model is pulled toward, so if either drifts from the postprocessor
+that ships, every later measurement is wrong while still looking plausible.
+This checks:
 
-* against known-answer inputs (oracle probabilities, all-merge, all-split)
-* against :func:`glyph_gnn.postprocess.group_characters`, which mirrors
-  ``crates/glyph-infer/src/postprocess.rs``, on random probabilities at every
-  threshold and several batch sizes
+* the metrics against known-answer inputs (oracle probabilities, all-merge,
+  all-split)
+* the metrics against :func:`glyph_gnn.postprocess.group_characters`, which
+  mirrors ``crates/glyph-infer/src/postprocess.rs``, on random probabilities at
+  every threshold and several batch sizes
+* the pair pooling against the hard max it stands in for
+* that the pair loss reacts to a single spiked edge, which is the failure the
+  point-edge loss cannot see
+* that turning the pair term off reproduces the old point-only objective
 
 Usage:
     python -m glyph_gnn.selftest --data dataset/ja-train
@@ -23,7 +29,8 @@ import torch
 from torch_geometric.loader import DataLoader
 
 from .dataset import load_shard
-from .metrics import DEFAULT_THRESHOLDS, GroupingEvaluator
+from .loss import focal_loss, glyph_loss, soft_max_pool
+from .metrics import DEFAULT_THRESHOLDS, GroupingEvaluator, contour_pair_index
 from .postprocess import group_characters
 
 
@@ -96,6 +103,85 @@ def check_agrees_with_postprocess(graphs: list, seed: int) -> None:
               " batched == postprocess")
 
 
+def check_pooling() -> None:
+    """The pair pooling must approach the max that inference actually takes."""
+    logits = torch.tensor([-3.0, -2.5, 4.0, -2.0, -3.5, 0.5])
+    index = torch.zeros(6, dtype=torch.long)
+
+    cold = float(soft_max_pool(logits, index, 1, temperature=0.01))
+    assert abs(cold - float(logits.max())) < 1e-3, (
+        f"temperature -> 0 must reproduce the hard max, got {cold}"
+    )
+    warm = float(soft_max_pool(logits, index, 1, temperature=1000.0))
+    assert abs(warm - float(logits.mean())) < 1e-2, (
+        f"a large temperature must tend to the mean, got {warm}"
+    )
+    # Between the two it stays inside the range, and above the mean: pooling
+    # must never be dragged below average by the quiet edges.
+    mid = float(soft_max_pool(logits, index, 1, temperature=1.0))
+    assert float(logits.mean()) < mid < float(logits.max())
+
+    # Two pairs at once, to catch a scatter that leaks across bins.
+    split = soft_max_pool(logits, torch.tensor([0, 0, 0, 1, 1, 1]), 2, 0.01)
+    assert abs(float(split[0]) - 4.0) < 1e-3 and abs(float(split[1]) - 0.5) < 1e-3
+
+    print("pooling ok | hard max, mean, and per-bin isolation all reproduce")
+
+
+def check_pair_loss_punishes_one_spike(graphs: list) -> None:
+    """One edge crossing the threshold merges two characters; the loss must see it.
+
+    This is the whole point of the pair term. A single false positive among a
+    pair's two dozen point edges is a rounding error to the point-edge loss but
+    destroys a character downstream, so the pair term has to react far more
+    strongly than the point term does.
+    """
+    graph = next(g for g in graphs
+                 if (g.y == 0).any() and (g.contour_id[g.edge_index[0]]
+                                          != g.contour_id[g.edge_index[1]]).any())
+    contour_id, edge_index, y = graph.contour_id, graph.edge_index, graph.y
+    inter, _, keys, _ = contour_pair_index(contour_id, edge_index)
+
+    # A moderately confident, entirely correct model.
+    correct = torch.where(y > 0.5, torch.full_like(y, 2.5), torch.full_like(y, -2.5))
+    settings = dict(pair_weight=0.5, intra_weight=0.05, temperature=1.0)
+    base, base_terms = glyph_loss(correct, y, contour_id, edge_index, **settings)
+
+    # Push one point edge of one negative pair over the line, as a false merge
+    # does. The other stored direction stays correct -- the max still takes it.
+    inter_edges = torch.nonzero(inter).squeeze(-1)
+    negative = inter_edges[torch.nonzero(y[inter] == 0).squeeze(-1)[0]]
+    spiked = correct.clone()
+    spiked[negative] = 5.0
+    hurt, hurt_terms = glyph_loss(spiked, y, contour_id, edge_index, **settings)
+
+    point_growth = hurt_terms["point"] / base_terms["point"]
+    pair_growth = hurt_terms["pair"] / base_terms["pair"]
+    assert hurt > base, "a false merge must cost more than a clean prediction"
+    assert pair_growth > point_growth, (
+        "the pair term must react harder than the point term, got pair"
+        f" x{pair_growth:.2f} vs point x{point_growth:.2f}"
+    )
+    print(f"pair loss ok | one spiked edge out of {int(inter.sum()):,} costs"
+          f" point x{point_growth:.2f}, pair x{pair_growth:.2f}"
+          f" ({keys.numel()} pairs)")
+
+
+def check_point_only_matches_focal(graphs: list) -> None:
+    """With the pair term off and intra edges unweighted, nothing has changed.
+
+    Guards the refactor: an old point-only run must still be reproducible.
+    """
+    graph = graphs[0]
+    torch.manual_seed(3)
+    logits = torch.randn(graph.y.numel())
+    combined, _ = glyph_loss(logits, graph.y, graph.contour_id, graph.edge_index,
+                             alpha=0.25, gamma=2.0, pair_weight=0.0, intra_weight=1.0)
+    expected = focal_loss(logits, graph.y, alpha=0.25, gamma=2.0)
+    assert torch.allclose(combined, expected), "pair_weight=0 must be the old objective"
+    print("compatibility ok | pair_weight=0, intra_weight=1 reproduces focal_loss")
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--data", required=True, help="directory holding .msgpack shards")
@@ -111,6 +197,9 @@ def main() -> None:
     print(f"{len(graphs)} graphs from {shards[0].name}\n")
 
     check_known_answers(graphs)
+    check_pooling()
+    check_point_only_matches_focal(graphs)
+    check_pair_loss_punishes_one_spike(graphs)
     print("\nagreement with glyph-infer's postprocessor:")
     check_agrees_with_postprocess(graphs, args.seed)
     print("\nall checks passed")
