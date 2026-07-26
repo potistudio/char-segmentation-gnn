@@ -197,6 +197,130 @@ class ContourLayer(nn.Module):
         return self.norm(hx + self.out(z)[contour_id])
 
 
+#: Width of :func:`group_scalars`.
+GROUP_SCALARS = 7
+
+
+def group_accumulators(contour_states: torch.Tensor, contour_attr: torch.Tensor,
+                       member_contour: torch.Tensor, member_group: torch.Tensor,
+                       num_groups: int) -> dict[str, torch.Tensor]:
+    """Reduces each candidate group's members into mergeable accumulators.
+
+    Every entry is a sum, a min or a max, so the union of two groups follows
+    from their accumulators alone. That is what lets the decoder walk a greedy
+    agglomeration -- thousands of candidate merges -- without re-pooling any
+    group from its contours.
+
+    ``member_contour`` and ``member_group`` are parallel: they list which
+    contour belongs to which candidate, so a contour may appear in several
+    candidates and a candidate need not be part of any partition.
+    """
+    states = contour_states[member_contour]
+    rows = contour_attr[member_contour]
+    width = states.shape[-1]
+    spread = member_group.unsqueeze(-1).expand(-1, width)
+
+    box_min = torch.stack([rows[:, C_MINX], rows[:, C_MINY]], dim=-1)
+    box_max = box_min + torch.stack([rows[:, C_W], rows[:, C_H]], dim=-1)
+    pair = member_group.unsqueeze(-1).expand(-1, 2)
+
+    def add(values: torch.Tensor, index: torch.Tensor, cols: int) -> torch.Tensor:
+        return values.new_zeros(num_groups, cols).scatter_add_(0, index, values)
+
+    return {
+        "sum_state": add(states, spread, width),
+        "max_state": states.new_zeros(num_groups, width).scatter_reduce_(
+            0, spread, states, reduce="amax", include_self=False),
+        "count": add(torch.ones_like(member_group, dtype=states.dtype).unsqueeze(-1),
+                     member_group.unsqueeze(-1), 1),
+        "box_min": box_min.new_full((num_groups, 2), float("inf")).scatter_reduce_(
+            0, pair, box_min, reduce="amin", include_self=False),
+        "box_max": box_max.new_full((num_groups, 2), float("-inf")).scatter_reduce_(
+            0, pair, box_max, reduce="amax", include_self=False),
+        "arc": add(rows[:, C_ARC].unsqueeze(-1), member_group.unsqueeze(-1), 1),
+        "area": add(rows[:, C_AREA].abs().unsqueeze(-1), member_group.unsqueeze(-1), 1),
+    }
+
+
+def group_scalars(acc: dict[str, torch.Tensor]) -> torch.Tensor:
+    """Shape statistics of a group, from its accumulators.
+
+    A character occupies roughly one cell and holds a bounded amount of ink, so
+    a group that is twice as wide as the line's pitch, or that carries a stroke
+    length no single glyph would, is the shape of a wrong merge.
+    """
+    eps = 1e-6
+    extent = (acc["box_max"] - acc["box_min"]).clamp(min=0.0)
+    width, height = extent[:, 0:1], extent[:, 1:2]
+    count, arc, area = acc["count"], acc["arc"], acc["area"]
+    return torch.cat([
+        width,
+        height,
+        count,
+        arc,
+        area,
+        width / height.clamp(min=eps),
+        arc / (width + height).clamp(min=eps),
+    ], dim=-1)
+
+
+def group_descriptor(acc: dict[str, torch.Tensor]) -> torch.Tensor:
+    """One row per group: pooled states plus its shape statistics."""
+    mean_state = acc["sum_state"] / acc["count"].clamp(min=1.0)
+    return torch.cat([mean_state, acc["max_state"], group_scalars(acc)], dim=-1)
+
+
+#: Width of :func:`group_descriptor`, given a hidden width.
+def descriptor_width(hidden: int) -> int:
+    return hidden * 2 + GROUP_SCALARS
+
+
+class GroupHead(nn.Module):
+    """Scores whether two groups of contours belong to the same character.
+
+    Not "is this set exactly one character": that question has no answer for the
+    partial groups an agglomerative decoder passes through. One stroke of "二"
+    is indistinguishable from the whole of "一", so a scorer trained on complete
+    characters marks every intermediate state as wrong and the decoder can never
+    build anything up. Measured: it left 25% of characters split against
+    union-find's 4.7%.
+
+    Asking about a *pair* of groups is well posed at every stage, which is why
+    learned agglomerative clustering is normally framed this way. Both sides and
+    their union are described, so the head sees what the merge would produce as
+    well as what it starts from.
+    """
+
+    def __init__(self, hidden: int, dropout: float = 0.0):
+        super().__init__()
+        # +1 for the edge model's own opinion of the link. Without it the head
+        # has to re-derive from pooled states and geometry what a well-trained
+        # pair classifier already says, and the strongest signal available goes
+        # unused; the scorer's job is to correct that opinion with group context,
+        # not to replace it.
+        self.net = nn.Sequential(
+            nn.Linear(descriptor_width(hidden) * 3 + hidden + 1, hidden),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden, hidden // 2),
+            nn.ReLU(),
+            nn.Linear(hidden // 2, 1),
+        )
+
+    def forward(self, left: dict[str, torch.Tensor], right: dict[str, torch.Tensor],
+                union: dict[str, torch.Tensor], line: torch.Tensor,
+                bridge: torch.Tensor) -> torch.Tensor:
+        """Raw merge logits.
+
+        ``line`` is the graph summary of each candidate; ``bridge`` is the edge
+        model's strongest link probability between the two groups.
+        """
+        feats = torch.cat([group_descriptor(left), group_descriptor(right),
+                           group_descriptor(union), line,
+                           bridge.unsqueeze(-1)], dim=-1)
+        return self.net(feats).squeeze(-1)
+
+
 class GlyphEdgeGNN(nn.Module):
     """Node encoder -> stacked edge-aware GAT layers -> edge classifier.
 
@@ -221,12 +345,14 @@ class GlyphEdgeGNN(nn.Module):
         contour_dim: int = 8,
         contours: bool = True,
         relations: bool = True,
+        group: bool = False,
     ):
         super().__init__()
         self.hparams = dict(
             node_dim=node_dim, edge_dim=edge_dim, hidden=hidden,
             layers=layers, heads=heads, dropout=dropout, context=context,
             contour_dim=contour_dim, contours=contours, relations=relations,
+            group=group,
         )
         # Initial layer aligning heterogeneous node feature dimensions.
         self.encoder = nn.Sequential(
@@ -257,6 +383,9 @@ class GlyphEdgeGNN(nn.Module):
         # free to gather and the decision is made here.
         classifier_in = (hidden * (4 if context else 3) + edge_dim
                          + (CONTOUR_RELATIONS if self.use_relations else 0))
+        # Scores a candidate grouping, which is what the decoder needs to
+        # accept or refuse a merge; see glyph_gnn.decode.
+        self.group_head = GroupHead(hidden, dropout) if group else None
         self.classifier = nn.Sequential(
             nn.Linear(classifier_in, hidden),
             nn.ReLU(),
@@ -304,10 +433,14 @@ class GlyphEdgeGNN(nn.Module):
             ~same, float("-inf")
         )
 
-    def forward(self, x: torch.Tensor, edge_index: torch.Tensor, edge_attr: torch.Tensor,
-                contour_id: torch.Tensor, contour_attr: torch.Tensor,
-                batch: torch.Tensor | None = None) -> torch.Tensor:
-        """Returns raw edge logits, shape [num_edges]."""
+    def trunk(self, x: torch.Tensor, edge_index: torch.Tensor, edge_attr: torch.Tensor,
+              contour_id: torch.Tensor, contour_attr: torch.Tensor,
+              batch: torch.Tensor | None):
+        """Runs message passing once. Returns (node states, line summary).
+
+        Split out of :meth:`forward` so the edge classifier and the group head
+        share one pass instead of each paying for their own.
+        """
         hx = self.encoder(x)
         relations = mask = None
         if self.contour_layers is not None:
@@ -322,22 +455,41 @@ class GlyphEdgeGNN(nn.Module):
             if self.contour_layers is not None:
                 hx = self.contour_layers[depth](hx, contour_id, contour_attr,
                                                 relations, mask)
+        summary = self.context(self.pool(hx, batch)) if self.context is not None else None
+        return hx, summary
+
+    def edge_logits(self, hx: torch.Tensor, summary: torch.Tensor | None,
+                    edge_index: torch.Tensor, edge_attr: torch.Tensor,
+                    contour_id: torch.Tensor, contour_attr: torch.Tensor,
+                    batch: torch.Tensor | None) -> torch.Tensor:
         src, dst = edge_index[0], edge_index[1]
         hs, hd = hx[src], hx[dst]
         parts = [hs, hd, (hs - hd).abs(), edge_attr]
         if self.use_relations:
             parts.append(contour_relations(contour_attr[contour_id[src]],
                                            contour_attr[contour_id[dst]]))
-        if self.context is not None:
-            summary = self.context(self.pool(hx, batch))
+        if summary is not None:
             parts.append(summary[batch[src]] if batch is not None
                          else summary.expand(src.shape[0], -1))
         return self.classifier(torch.cat(parts, dim=-1)).squeeze(-1)
 
+    def contour_states(self, hx: torch.Tensor, contour_id: torch.Tensor,
+                       contour_attr: torch.Tensor) -> torch.Tensor:
+        """One state per contour, pooled from the points it owns."""
+        return scatter_mean(hx, contour_id, contour_attr.shape[0])
+
+    def forward(self, x: torch.Tensor, edge_index: torch.Tensor, edge_attr: torch.Tensor,
+                contour_id: torch.Tensor, contour_attr: torch.Tensor,
+                batch: torch.Tensor | None = None) -> torch.Tensor:
+        """Returns raw edge logits, shape [num_edges]."""
+        hx, summary = self.trunk(x, edge_index, edge_attr, contour_id, contour_attr, batch)
+        return self.edge_logits(hx, summary, edge_index, edge_attr,
+                                contour_id, contour_attr, batch)
+
 
 MODEL_HPARAM_KEYS = frozenset(
     {"node_dim", "edge_dim", "hidden", "layers", "heads", "dropout", "context",
-     "contour_dim", "contours", "relations"}
+     "contour_dim", "contours", "relations", "group"}
 )
 GRAPH_HPARAM_KEYS = frozenset({"knn", "radius", "contour_bridge"})
 
@@ -346,7 +498,8 @@ GRAPH_HPARAM_KEYS = frozenset({"knn", "radius", "contour_bridge"})
 #: one of them simply has no key for it, and that absence has to read as "off"
 #: rather than as the current default -- otherwise loading it fails on weights
 #: the run never had.
-ADDED_LATER = {"context": False, "contours": False, "relations": False}
+ADDED_LATER = {"context": False, "contours": False, "relations": False,
+               "group": False}
 
 
 def model_hparams(hparams: dict) -> dict:

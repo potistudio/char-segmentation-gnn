@@ -30,6 +30,7 @@ from torch_geometric.data import Batch
 from torch_geometric.loader import DataLoader
 
 from .dataset import load_shard
+from .decode import merge_accumulators
 from .loss import focal_loss, glyph_loss, soft_max_pool
 from .metrics import DEFAULT_THRESHOLDS, GroupingEvaluator, contour_pair_index
 from .model import (
@@ -40,6 +41,7 @@ from .model import (
     C_W,
     GlyphEdgeGNN,
     contour_relations,
+    group_accumulators,
 )
 from .postprocess import group_characters
 
@@ -184,6 +186,43 @@ def check_contour_layout(graphs: list) -> None:
     print(f"contour layout ok | {checked:,} contour boxes agree with their nodes")
 
 
+def check_accumulators_merge(graphs: list) -> None:
+    """Merging two groups' accumulators must equal pooling their union.
+
+    The greedy decoder never re-pools: it folds accumulators together, which is
+    the only reason thousands of candidate merges are affordable. If that
+    shortcut drifts from the real reduction, the scorer is asked about groups
+    that do not exist and nothing downstream would notice.
+    """
+    graph = next(g for g in graphs if int(g.contour_attr.shape[0]) >= 4)
+    contours = int(graph.contour_attr.shape[0])
+    torch.manual_seed(11)
+    states = torch.randn(contours, 32)
+
+    left_members = list(range(0, contours, 2))
+    right_members = list(range(1, contours, 2))
+    both = left_members + right_members
+
+    def pool(members: list[int], slot: int, size: int) -> dict:
+        index = torch.tensor(members, dtype=torch.long)
+        return group_accumulators(states, graph.contour_attr, index,
+                                  torch.full_like(index, slot), size)
+
+    sides = {}
+    for name, members in (("left", left_members), ("right", right_members)):
+        sides[name] = pool(members, 0, 1)
+    stacked = {key: torch.cat([sides["left"][key], sides["right"][key]])
+               for key in sides["left"]}
+    folded = merge_accumulators(stacked, torch.tensor([0]), torch.tensor([1]))
+    direct = pool(both, 0, 1)
+
+    for key in direct:
+        gap = float((folded[key] - direct[key]).abs().max())
+        assert gap < 1e-4, f"folded {key} differs from a direct pool by {gap:.3e}"
+    print(f"accumulators ok | folding {len(left_members)}+{len(right_members)}"
+          " contours matches pooling them together")
+
+
 def check_pooling() -> None:
     """The pair pooling must approach the max that inference actually takes."""
     logits = torch.tensor([-3.0, -2.5, 4.0, -2.0, -3.5, 0.5])
@@ -279,6 +318,7 @@ def main() -> None:
 
     check_known_answers(graphs)
     check_contour_layout(graphs)
+    check_accumulators_merge(graphs)
     check_single_graph_matches_batched(graphs)
     check_pooling()
     check_point_only_matches_focal(graphs)

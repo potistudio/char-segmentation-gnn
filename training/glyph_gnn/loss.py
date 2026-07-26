@@ -84,6 +84,22 @@ def soft_max_pool(
     return logits.new_zeros(size).scatter_add_(0, index, weight * logits)
 
 
+def group_loss(group_logits: torch.Tensor, group_labels: torch.Tensor) -> torch.Tensor:
+    """BCE over candidate merges, rebalanced to the sampler's actual ratio.
+
+    Only multi-contour characters can be cut in two, so positives are scarcer
+    than negatives -- about 3 in 10 for Japanese, fewer for Latin. Left alone
+    that bias lands squarely on "do not merge", and a decoder that will not
+    merge leaves every multi-stroke character in pieces. The weight is measured
+    per batch rather than assumed, since the ratio follows the script.
+    """
+    positives = group_labels.sum()
+    negatives = group_labels.numel() - positives
+    weight = (negatives / positives.clamp(min=1.0)).clamp(1.0, 20.0)
+    return F.binary_cross_entropy_with_logits(group_logits, group_labels,
+                                              pos_weight=weight)
+
+
 def glyph_loss(
     logits: torch.Tensor,
     targets: torch.Tensor,

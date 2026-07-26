@@ -26,9 +26,25 @@ from .dataset import (
     load_packed,
     make_loader,
 )
-from .loss import glyph_loss
-from .metrics import DEFAULT_THRESHOLDS, GroupingEvaluator, format_sweep
-from .model import GlyphEdgeGNN
+from .decode import (
+    greedy_groups,
+    merge_accumulators,
+    pair_bridge,
+    training_candidates,
+)
+from .loss import glyph_loss, group_loss
+from .metrics import (
+    DEFAULT_MARGINS,
+    DEFAULT_THRESHOLDS,
+    GroupingEvaluator,
+    PartitionAccumulator,
+    contour_owners,
+    contour_pair_index,
+    format_greedy,
+    format_sweep,
+    scatter_amax,
+)
+from .model import GlyphEdgeGNN, group_accumulators
 from .pack import is_packed
 
 
@@ -77,6 +93,7 @@ def print_run_summary(args, model, train_stats, val_stats, steps_per_epoch,
         f" | global context {'off' if args.no_global_context else 'on'}"
         f" | contour layers {'off' if args.no_contour_layers else 'on'}"
         f" | relations {'off' if args.no_contour_relations else 'on'}"
+        f" | group head {'on' if args.group_head else 'off'}"
         f" | {params:,} params"
     )
     optim_row = (
@@ -122,18 +139,70 @@ def release(device) -> None:
         torch.cuda.empty_cache()
 
 
-@torch.no_grad()
-def evaluate(model, loader, device, settings: dict,
-             thresholds=DEFAULT_THRESHOLDS, progress: bool = True) -> dict:
-    """Runs one validation pass and scores it at every threshold.
+def run_model(model, batch, settings: dict, group_weight: float):
+    """One forward pass, its loss, and the parts a decoder needs afterwards."""
+    hx, summary = model.trunk(batch.x, batch.edge_index, batch.edge_attr,
+                              batch.contour_id, batch.contour_attr, batch.batch)
+    logits = model.edge_logits(hx, summary, batch.edge_index, batch.edge_attr,
+                               batch.contour_id, batch.contour_attr, batch.batch)
+    loss, terms = glyph_loss(logits, batch.y, batch.contour_id, batch.edge_index,
+                             **settings)
+    terms["group"] = 0.0
+    states = None
+    if model.group_head is not None:
+        states = model.contour_states(hx, batch.contour_id, batch.contour_attr)
+        if group_weight > 0.0:
+            contour_char, contour_graph, contours = contour_owners(
+                batch.contour_id, batch.char_id, batch.batch)
+            inter, inverse, keys, stride = contour_pair_index(batch.contour_id,
+                                                             batch.edge_index)
+            probs = torch.sigmoid(logits.detach())
+            bridge = pair_bridge(keys // stride, keys % stride,
+                                 scatter_amax(probs[inter], inverse, keys.numel()),
+                                 contours)
+            members, groups, left, right, labels, owners, links = training_candidates(
+                contour_char, contour_graph, batch.contour_attr, bridge)
+            acc = group_accumulators(states, batch.contour_attr, members, groups,
+                                     int(groups.max()) + 1)
+            line = line_summary(summary, owners, states.shape[-1])
 
-    Contour-pair probabilities are accumulated once and swept afterwards, so
-    the sweep costs no extra forward passes. The point-edge scores are kept
-    alongside for continuity with older runs, but they are not what selects
-    the checkpoint: 75-79% of edges are intra-contour and trivially positive.
+            def side(index: torch.Tensor) -> dict[str, torch.Tensor]:
+                return {key: value[index] for key, value in acc.items()}
+
+            union = merge_accumulators(acc, left, right)
+            scored = group_loss(
+                model.group_head(side(left), side(right), union, line, links), labels)
+            loss = loss + group_weight * scored
+            terms["group"] = float(scored.detach())
+    return logits, loss, terms, states, summary
+
+
+def line_summary(summary, owners, width: int):
+    """Per-group line context, or zeros when the graph summary is switched off."""
+    if summary is None:
+        return torch.zeros(owners.shape[0], width, device=owners.device)
+    return summary[owners]
+
+
+@torch.no_grad()
+def evaluate(model, loader, device, settings: dict, group_weight: float = 0.0,
+             thresholds=DEFAULT_THRESHOLDS, margins=DEFAULT_MARGINS,
+             progress: bool = True) -> dict:
+    """Runs one validation pass and scores both decoders on it.
+
+    Contour-pair probabilities are accumulated once and swept afterwards, so the
+    threshold sweep costs no extra forward passes. The greedy decoder cannot be
+    deferred that way -- it has to consult the group scorer as it merges -- so it
+    runs inside the loop, once per candidate margin.
+
+    The point-edge scores are kept for continuity with older runs, but they are
+    not what selects the checkpoint: 75-79% of edges are intra-contour and
+    trivially positive.
     """
     model.eval()
     grouping = GroupingEvaluator()
+    greedy = {margin: PartitionAccumulator() for margin in margins} \
+        if model.group_head is not None else {}
     tp = fp = fn = tn = 0
     total_loss = 0.0
     graphs = 0
@@ -142,18 +211,18 @@ def evaluate(model, loader, device, settings: dict,
     for batch in bar:
         batch = batch.to(device)
         try:
-            logits = model(batch.x, batch.edge_index, batch.edge_attr,
-                           batch.contour_id, batch.contour_attr, batch.batch)
-            loss, _ = glyph_loss(logits, batch.y, batch.contour_id, batch.edge_index,
-                                 **settings)
+            logits, loss, _, states, summary = run_model(model, batch, settings,
+                                                         group_weight)
         except torch.OutOfMemoryError:
-            batch = logits = loss = None
+            batch = logits = loss = states = None
             release(device)
             continue
         total_loss += loss.item() * batch.num_graphs
         graphs += batch.num_graphs
         probs = torch.sigmoid(logits)
         grouping.add(batch, probs)
+        if greedy:
+            decode_batch(model, batch, probs, states, summary, greedy)
         pred = (probs >= 0.5).float()
         y = batch.y
         tp += int(((pred == 1) & (y == 1)).sum())
@@ -167,8 +236,33 @@ def evaluate(model, loader, device, settings: dict,
 
     sweep = grouping.sweep(thresholds)
     best = max(sweep, key=lambda m: (m["grouping_acc"], m["threshold"]))
-    return {**best, "sweep": sweep, "edge_f1_neg": f1_n,
-            "loss": total_loss / max(graphs, 1)}
+    out = {**best, "sweep": sweep, "edge_f1_neg": f1_n,
+           "loss": total_loss / max(graphs, 1)}
+    if greedy:
+        scored = [{**accumulator.score(), "margin": margin}
+                  for margin, accumulator in greedy.items()]
+        out["greedy_sweep"] = scored
+        out["greedy"] = max(scored, key=lambda m: (m["grouping_acc"], -m["margin"]))
+    return out
+
+
+@torch.no_grad()
+def decode_batch(model, batch, probs, states, summary, greedy: dict) -> None:
+    """Runs the greedy decoder at every candidate margin on one batch."""
+    contour_char, contour_graph, _ = contour_owners(
+        batch.contour_id, batch.char_id, batch.batch)
+    inter, inverse, keys, stride = contour_pair_index(batch.contour_id, batch.edge_index)
+    if keys.numel() == 0:
+        return
+    pair_prob = scatter_amax(probs[inter].float(), inverse, keys.numel())
+    pair_a, pair_b = keys // stride, keys % stride
+    width = states.shape[-1]
+    line = (summary if summary is not None
+            else torch.zeros(int(batch.num_graphs), width, device=states.device))
+    for margin, accumulator in greedy.items():
+        root = greedy_groups(model.group_head, states, batch.contour_attr,
+                             contour_graph, line, pair_a, pair_b, pair_prob, margin)
+        accumulator.add(root, contour_char, contour_graph, int(batch.num_graphs))
 
 
 def main() -> None:
@@ -185,6 +279,14 @@ def main() -> None:
     ap.add_argument("--layers", type=int, default=4)
     ap.add_argument("--heads", type=int, default=4)
     ap.add_argument("--dropout", type=float, default=0.1)
+    ap.add_argument("--group-loss-weight", type=float, default=0.5,
+                    help="weight on the group-scorer term. The scorer is what lets"
+                         " the greedy decoder refuse a merge, so 0 leaves it"
+                         " untrained and only union-find is usable")
+    ap.add_argument("--group-head", action="store_true",
+                    help="train the group scorer and also report the greedy decoder."
+                         " Off by default: it beats union-find on merges but leaves "
+                         "far more characters split, so it loses overall")
     ap.add_argument("--no-contour-relations", action="store_true",
                     help="drop the derived contour-pair geometry (bbox overlap, gap,"
                          " containment, winding) from the attention bias and the"
@@ -237,6 +339,7 @@ def main() -> None:
     device = torch.device(args.device)
     thresholds = (tuple(float(t) for t in args.thresholds.split(","))
                   if args.thresholds else DEFAULT_THRESHOLDS)
+    margins = DEFAULT_MARGINS
     settings = loss_settings(args)
 
     packed = is_packed(args.data)
@@ -278,7 +381,7 @@ def main() -> None:
         node_dim=dataset_node_dim(train_set), contour_dim=dataset_contour_dim(train_set),
         hidden=args.hidden, layers=args.layers, heads=args.heads, dropout=args.dropout,
         context=not args.no_global_context, contours=not args.no_contour_layers,
-        relations=not args.no_contour_relations,
+        relations=not args.no_contour_relations, group=args.group_head,
     ).to(device)
     model.hparams.update(
         knn=args.knn,
@@ -309,15 +412,13 @@ def main() -> None:
         lr = optim.param_groups[0]["lr"]
         batches = tqdm(train_loader, desc=f"  epoch {epoch}/{args.epochs}", unit="batch",
                        leave=False, disable=None if progress else True)
-        parts = {"point": 0.0, "pair": 0.0}
+        parts = {"point": 0.0, "pair": 0.0, "group": 0.0}
         for batch in batches:
             batch = batch.to(device)
             optim.zero_grad(set_to_none=True)
             try:
-                logits = model(batch.x, batch.edge_index, batch.edge_attr,
-                           batch.contour_id, batch.contour_attr, batch.batch)
-                loss, terms = glyph_loss(logits, batch.y, batch.contour_id,
-                                         batch.edge_index, **settings)
+                _, loss, terms, _, _ = run_model(model, batch, settings,
+                                                 args.group_loss_weight)
                 loss.backward()
             except torch.OutOfMemoryError:
                 # One oversized batch should not kill a multi-hour run.
@@ -340,7 +441,8 @@ def main() -> None:
                        " lower --max-edges-per-batch")
         sched.step()
 
-        metrics = evaluate(model, val_loader, device, settings, thresholds,
+        metrics = evaluate(model, val_loader, device, settings,
+                           args.group_loss_weight, thresholds, margins,
                            progress) if val_set else {}
         avg_loss = total_loss / max(seen, 1)
         elapsed = time.time() - t0
@@ -357,7 +459,8 @@ def main() -> None:
 
         line = (f"epoch {epoch:3d}/{args.epochs} | loss {avg_loss:.4f}"
                 f" (pt {parts['point'] / max(seen, 1):.4f}"
-                f" pr {parts['pair'] / max(seen, 1):.4f}) | lr {lr:.2e}"
+                f" pr {parts['pair'] / max(seen, 1):.4f}"
+                f" gr {parts['group'] / max(seen, 1):.4f}) | lr {lr:.2e}"
                 f" | {format_duration(elapsed)} | {seen / max(elapsed, 1e-9):.0f} graphs/s")
         if device.type == "cuda":
             line += f" | peak {torch.cuda.max_memory_allocated(device) / 2**30:.1f}GiB"
@@ -369,6 +472,12 @@ def main() -> None:
                 f" | split {metrics['char_split_rate']:.4f}"
                 f" merge {metrics['char_merge_rate']:.4f}"
             )
+            if "greedy" in metrics:
+                g = metrics["greedy"]
+                line += (f" | greedy {g['grouping_acc']:.4f}"
+                         f" @{g['margin']:+.2f}"
+                         f" split {g['char_split_rate']:.4f}"
+                         f" merge {g['char_merge_rate']:.4f}")
         if is_best:
             line += "  <- best"
         tqdm.write(line)
@@ -376,8 +485,11 @@ def main() -> None:
     epochs.close()
 
     if metrics:
-        print("\nthreshold sweep (final epoch):")
+        print("\nthreshold sweep, union-find decoder (final epoch):")
         print(format_sweep(metrics["sweep"]))
+        if "greedy_sweep" in metrics:
+            print("\nmin-score sweep, greedy decoder (final epoch):")
+            print(format_greedy(metrics["greedy_sweep"]))
 
     torch.save(
         {"state_dict": model.state_dict(), "hparams": model.hparams,
