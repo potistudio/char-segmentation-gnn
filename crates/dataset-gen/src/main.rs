@@ -97,6 +97,71 @@ struct Args {
     /// Max sampled points per contour.
     #[arg(long, default_value_t = 64)]
     max_points: usize,
+
+    /// Tightest tracking (em). The far end of the tail, not the typical value.
+    #[arg(long, default_value_t = -0.18, allow_negative_numbers = true)]
+    tracking_min: f32,
+
+    /// Loosest tracking (em). Ordinary text is often set slightly loose, so
+    /// this needs to reach past zero or the model never sees an open line.
+    #[arg(long, default_value_t = 0.04, allow_negative_numbers = true)]
+    tracking_max: f32,
+
+    /// Shapes the tracking distribution between the two bounds. 1 is uniform;
+    /// above 1 concentrates samples near `--tracking-max` and leaves the tight
+    /// end as a tail. The default puts the median near -0.02 em -- ordinary
+    /// text, slightly tight -- with about a quarter of samples tighter than
+    /// -0.08 em to keep the intersecting-path cases in the corpus.
+    #[arg(long, default_value_t = 1.8)]
+    tracking_skew: f32,
+
+    /// Max per-glyph vertical shift (em). Properly set text has none, and
+    /// baseline alignment is a real cue for grouping, so shaking it hides
+    /// signal rather than adding robustness. Set 0 to disable.
+    #[arg(long, default_value_t = 0.02)]
+    baseline_jitter: f32,
+
+    /// Horizontal scale applied to the whole line (condensed / extended).
+    #[arg(long, default_value_t = 0.8)]
+    aspect_x_min: f32,
+    #[arg(long, default_value_t = 1.25)]
+    aspect_x_max: f32,
+
+    /// Max uniform jitter added to every outline point (em).
+    #[arg(long, default_value_t = 0.004)]
+    point_noise: f32,
+}
+
+impl Args {
+    /// Draws one tracking value from the skewed distribution.
+    fn tracking(&self, rng: &mut Pcg64Mcg) -> f32 {
+        let span = self.tracking_max - self.tracking_min;
+        if span <= 0.0 {
+            return self.tracking_max;
+        }
+        let u: f32 = rng.random_range(0.0f32..1.0);
+        self.tracking_max - span * u.powf(self.tracking_skew.max(1e-3))
+    }
+
+    fn validate(&self) -> Result<()> {
+        if self.tracking_min > self.tracking_max {
+            bail!(
+                "--tracking-min ({}) exceeds --tracking-max ({})",
+                self.tracking_min,
+                self.tracking_max
+            );
+        }
+        if self.aspect_x_min > self.aspect_x_max || self.aspect_x_min <= 0.0 {
+            bail!("--aspect-x-min must be positive and not exceed --aspect-x-max");
+        }
+        if self.tracking_skew <= 0.0 {
+            bail!("--tracking-skew must be positive");
+        }
+        if self.baseline_jitter < 0.0 || self.point_noise < 0.0 {
+            bail!("--baseline-jitter and --point-noise cannot be negative");
+        }
+        Ok(())
+    }
 }
 
 struct FontEntry {
@@ -247,11 +312,12 @@ fn generate_one(
     };
 
     let layout_cfg = LayoutConfig {
-        // Bias toward squeezing so intersecting paths dominate the dataset.
-        tracking: rng.random_range(-0.18f32..0.02),
-        baseline_jitter: rng.random_range(0.0f32..0.06),
-        aspect_x: rng.random_range(0.8f32..1.25),
-        point_noise: rng.random_range(0.0f32..0.004),
+        // Tracking is drawn once per sample, so the pitch stays regular along
+        // the line -- which is the cue the model needs it to be.
+        tracking: args.tracking(&mut rng),
+        baseline_jitter: rng.random_range(0.0f32..=args.baseline_jitter),
+        aspect_x: rng.random_range(args.aspect_x_min..=args.aspect_x_max),
+        point_noise: rng.random_range(0.0f32..=args.point_noise),
     };
 
     let (contours, upem) = layout_text(&font.data, &text, &layout_cfg, &mut rng).ok()?;
@@ -282,8 +348,21 @@ fn main() -> Result<()> {
         args.deco_ratio * 100.0
     );
 
+    args.validate()?;
+
     let source = resolve_text_source(&args)?;
     println!("text source: {}", source.describe());
+    println!(
+        "layout: tracking {:.3}..{:.3} em (skew {}) | baseline jitter <= {:.3} em\
+         \n        aspect x {:.2}..{:.2} | point noise <= {:.4} em",
+        args.tracking_min,
+        args.tracking_max,
+        args.tracking_skew,
+        args.baseline_jitter,
+        args.aspect_x_min,
+        args.aspect_x_max,
+        args.point_noise,
+    );
 
     let graph_cfg = GraphConfig {
         sample: SampleConfig {
@@ -379,6 +458,61 @@ mod tests {
             picked,
             ["ll", "rI", "\u{3053}", "ll", "rI", "\u{3053}", "ll"]
         );
+    }
+
+    fn default_args() -> Args {
+        Args::parse_from(["dataset-gen", "--body-fonts", ".", "--out", "."])
+    }
+
+    #[test]
+    fn tracking_defaults_sit_on_ordinary_text() {
+        // "Ordinary, slightly tight" is the target: the median a touch below
+        // zero, a real share of open lines, and the intersecting-path cases
+        // kept as a minority tail rather than most of the corpus.
+        let args = default_args();
+        let mut rng = Pcg64Mcg::seed_from_u64(7);
+        let mut values: Vec<f32> = (0..20_000).map(|_| args.tracking(&mut rng)).collect();
+        values.sort_by(f32::total_cmp);
+
+        let median = values[values.len() / 2];
+        let loose = values.iter().filter(|&&t| t > 0.0).count() as f32 / values.len() as f32;
+        let tight = values.iter().filter(|&&t| t < -0.08).count() as f32 / values.len() as f32;
+
+        assert!(
+            (-0.04..=-0.01).contains(&median),
+            "median tracking {median} should sit just below zero"
+        );
+        assert!(
+            (0.25..=0.5).contains(&loose),
+            "{loose} of samples set loose; ordinary text needs a real share"
+        );
+        assert!(
+            (0.15..=0.35).contains(&tight),
+            "{tight} of samples tighter than -0.08 em; wanted a minority tail"
+        );
+        assert!(*values.first().unwrap() >= args.tracking_min);
+        assert!(*values.last().unwrap() <= args.tracking_max);
+    }
+
+    #[test]
+    fn tracking_collapses_to_a_fixed_value_for_banded_eval() {
+        // Equal bounds pin the tracking, which is how a per-band evaluation set
+        // is generated.
+        let mut args = default_args();
+        args.tracking_min = -0.1;
+        args.tracking_max = -0.1;
+        let mut rng = Pcg64Mcg::seed_from_u64(1);
+        for _ in 0..100 {
+            assert!((args.tracking(&mut rng) - -0.1).abs() < 1e-6);
+        }
+    }
+
+    #[test]
+    fn validate_rejects_inverted_bounds() {
+        let mut args = default_args();
+        args.tracking_min = 0.1;
+        args.tracking_max = -0.1;
+        assert!(args.validate().is_err());
     }
 
     #[test]
