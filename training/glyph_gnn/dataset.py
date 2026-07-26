@@ -23,6 +23,8 @@ from torch_geometric.loader import DataLoader
 from tqdm.auto import tqdm
 
 from .pack import (
+    CHAR_ID,
+    CONTOUR_ID,
     DIST,
     DX,
     DY,
@@ -36,7 +38,34 @@ from .pack import (
 )
 
 
-def load_shard(path: Path) -> list[Data]:
+class GlyphData(Data):
+    """``Data`` that keeps contour and character ids disjoint across a batch.
+
+    Both are per-node labels that index into a per-graph namespace, so PyG
+    has to shift them by the running count the same way it shifts
+    ``edge_index``; otherwise contour 0 of every graph in the batch collapses
+    into one contour and the grouping metrics silently merge graphs.
+    """
+
+    def __inc__(self, key, value, *args, **kwargs):
+        if key == "contour_id":
+            return self.num_contours
+        if key == "char_id":
+            return self.num_chars
+        return super().__inc__(key, value, *args, **kwargs)
+
+
+def make_data(x, edge_index, edge_attr, y, contour_id, char_id) -> GlyphData:
+    """Builds one graph, deriving the id ranges the batcher needs."""
+    data = GlyphData(x=x, edge_index=edge_index, edge_attr=edge_attr, y=y)
+    data.contour_id = contour_id
+    data.char_id = char_id
+    data.num_contours = int(contour_id.max()) + 1 if contour_id.numel() else 0
+    data.num_chars = int(char_id.max()) + 1 if char_id.numel() else 0
+    return data
+
+
+def load_shard(path: Path) -> list[GlyphData]:
     """Decodes one Rust-generated MessagePack shard into PyG ``Data`` objects."""
     with open(path, "rb") as f:
         samples = msgpack.unpackb(f.read(), raw=False)
@@ -46,11 +75,14 @@ def load_shard(path: Path) -> list[Data]:
         n = s["num_nodes"]
         node_dim = s["node_dim"]
         edge_dim = s["edge_dim"]
-        x = torch.tensor(s["node_features"], dtype=torch.float32).view(n, node_dim)
-        edge_index = torch.tensor(s["edge_index"], dtype=torch.long).view(2, -1)
-        edge_attr = torch.tensor(s["edge_features"], dtype=torch.float32).view(-1, edge_dim)
-        y = torch.tensor(s["edge_labels"], dtype=torch.float32)
-        data = Data(x=x, edge_index=edge_index, edge_attr=edge_attr, y=y)
+        data = make_data(
+            x=torch.tensor(s["node_features"], dtype=torch.float32).view(n, node_dim),
+            edge_index=torch.tensor(s["edge_index"], dtype=torch.long).view(2, -1),
+            edge_attr=torch.tensor(s["edge_features"], dtype=torch.float32).view(-1, edge_dim),
+            y=torch.tensor(s["edge_labels"], dtype=torch.float32),
+            contour_id=torch.tensor(s["node_contour_ids"], dtype=torch.long),
+            char_id=torch.tensor(s["node_char_ids"], dtype=torch.long),
+        )
         data.font = s.get("font", "")
         data.text = s.get("text", "")
         out.append(data)
@@ -148,6 +180,7 @@ class PackedGlyphDataset(torch.utils.data.Dataset):
             "edge_index": _starts(self.num_edges * 2),
             "edge_delta": _starts(self.num_edges * 2),
             "flags": _starts(self.num_edges),
+            "node_ids": _starts(self.num_nodes * 2),
         }
         self.ids = (np.arange(len(self.num_nodes), dtype=np.int64) if ids is None
                     else np.asarray(ids, dtype=np.int64))
@@ -189,11 +222,12 @@ class PackedGlyphDataset(torch.utils.data.Dataset):
         attr[:, SAME_CONTOUR] = (flags & SAME_CONTOUR_BIT) != 0
         return attr
 
-    def __getitem__(self, i: int) -> Data:
+    def __getitem__(self, i: int) -> GlyphData:
         gid = int(self.ids[i])
         n, e = int(self.num_nodes[gid]), int(self.num_edges[gid])
         flags = self._read("flags", gid, e)
-        data = Data(
+        node_ids = self._read("node_ids", gid, n * 2).reshape(n, 2).astype(np.int64)
+        data = make_data(
             x=torch.from_numpy(
                 self._read("x", gid, n * self.node_dim).copy()
             ).view(n, self.node_dim),
@@ -203,6 +237,8 @@ class PackedGlyphDataset(torch.utils.data.Dataset):
             ).view(2, e),
             edge_attr=torch.from_numpy(self._edge_attr(gid, e, flags)),
             y=torch.from_numpy(((flags & LABEL_BIT) != 0).astype(np.float32)),
+            contour_id=torch.from_numpy(node_ids[:, CONTOUR_ID].copy()),
+            char_id=torch.from_numpy(node_ids[:, CHAR_ID].copy()),
         )
         data.font = str(self.fonts[gid])
         data.text = str(self.texts[gid])

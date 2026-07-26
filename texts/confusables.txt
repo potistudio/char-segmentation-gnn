@@ -1,0 +1,118 @@
+# Fixed evaluation texts for the two failure modes, one text per line.
+# Blank lines and lines starting with `#` are skipped.
+#
+#     cargo run --release -p dataset-gen -- \
+#         --body-fonts fonts/ja-train --deco-fonts fonts/ja-train \
+#         --text-file texts/confusables.txt --count 20000 --out dataset/confusables
+#     uv run python -m glyph_gnn.eval --checkpoint <ckpt> --data dataset/confusables
+#
+# Every line is rendered the same number of times across fonts and
+# augmentations, so the per-pattern accuracies in the eval breakdown are
+# directly comparable. Each merge case is paired with the single character it
+# gets confused with, so the breakdown shows both error directions: if the
+# model fixes `ll` by splitting harder, `m` and `w` start splitting too.
+
+# --- Latin: adjacent stems that merge into one group ---
+ll
+lll
+llll
+Il
+lI
+II
+ll1
+1l1
+ii
+iii
+ij
+IJ
+ri
+rI
+rn
+rm
+tt
+ft
+fi
+fl
+li
+lt
+nn
+cl
+vv
+ww
+xx
+# controls: single glyphs the pairs above are confused with
+m
+w
+n
+d
+h
+u
+b
+k
+# --- Latin: one character whose parts can be split apart ---
+i
+j
+%
+=
+"
+:
+;
+!
+?
+E
+F
+H
+T
+
+# --- Japanese: strokes of one character that get split apart ---
+こ
+い
+に
+り
+ハ
+ル
+リ
+ソ
+ン
+バ
+パ
+た
+な
+は
+ほ
+け
+シ
+ツ
+# --- Japanese: multi-stroke characters that read as several characters ---
+二
+三
+川
+小
+心
+氵
+冫
+北
+非
+林
+朋
+竹
+羽
+# --- Japanese: the pairs those characters get confused with ---
+一一
+一一一
+丨丨丨
+ロロ
+口口
+木木
+月月
+# --- Japanese: kana runs where the boundary is genuinely tight ---
+こと
+ここ
+いい
+たた
+リリ
+ソン
+ンソ
+ハハ
+にに
+りり

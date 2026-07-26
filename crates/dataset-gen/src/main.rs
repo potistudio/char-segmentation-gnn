@@ -61,15 +61,22 @@ struct Args {
     #[arg(
         long,
         default_value = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789",
-        conflicts_with = "charset_file"
+        conflicts_with_all = ["charset_file", "text_file"]
     )]
     charset: String,
 
     /// UTF-8 text file listing drawable characters. Lines starting with `#` and
     /// blank lines are skipped; all other characters on each line join the pool.
     /// Duplicate characters increase sampling weight.
-    #[arg(long, conflicts_with = "charset")]
+    #[arg(long, conflicts_with_all = ["charset", "text_file"])]
     charset_file: Option<PathBuf>,
+
+    /// UTF-8 file of fixed texts, one per line, rendered round-robin instead of
+    /// sampling random strings. Every line gets the same number of samples with
+    /// different fonts and augmentation, which is what makes a per-pattern
+    /// breakdown comparable. `--min-chars` / `--max-chars` do not apply.
+    #[arg(long, conflicts_with_all = ["charset", "charset_file"])]
+    text_file: Option<PathBuf>,
 
     /// Graph construction: max neighbors per node.
     #[arg(long, default_value_t = 8)]
@@ -127,18 +134,22 @@ fn rustybuzz_face_ok(data: &[u8]) -> bool {
     glyph_core::layout::layout_probe(data)
 }
 
+/// Reads the meaningful lines of a UTF-8 list file, dropping `#` comments
+/// and blank lines.
+fn read_list_file(path: &Path) -> Result<Vec<String>> {
+    let content =
+        fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+    Ok(content
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .map(str::to_owned)
+        .collect())
+}
+
 /// Load a charset pool from a UTF-8 text file.
 fn load_charset_file(path: &Path) -> Result<String> {
-    let content = fs::read_to_string(path)
-        .with_context(|| format!("reading charset file {}", path.display()))?;
-    let mut charset = String::new();
-    for line in content.lines() {
-        let trimmed = line.trim();
-        if trimmed.is_empty() || trimmed.starts_with('#') {
-            continue;
-        }
-        charset.push_str(trimmed);
-    }
+    let charset = read_list_file(path)?.concat();
     if charset.is_empty() {
         bail!(
             "charset file {} contains no drawable characters",
@@ -148,9 +159,50 @@ fn load_charset_file(path: &Path) -> Result<String> {
     Ok(charset)
 }
 
-fn resolve_charset(args: &Args) -> Result<Vec<char>> {
+/// Load fixed evaluation texts, one per line.
+fn load_text_file(path: &Path) -> Result<Vec<String>> {
+    let texts = read_list_file(path)?;
+    if texts.is_empty() {
+        bail!("text file {} contains no texts", path.display());
+    }
+    Ok(texts)
+}
+
+/// Where sample texts come from.
+enum TextSource {
+    /// Random strings drawn from a character pool.
+    Charset(Vec<char>),
+    /// A fixed list rendered round-robin, for per-pattern evaluation.
+    Fixed(Vec<String>),
+}
+
+impl TextSource {
+    fn describe(&self) -> String {
+        match self {
+            TextSource::Charset(chars) => format!("{} chars", chars.len()),
+            TextSource::Fixed(texts) => format!("{} fixed texts", texts.len()),
+        }
+    }
+}
+
+fn resolve_text_source(args: &Args) -> Result<TextSource> {
+    if let Some(path) = &args.text_file {
+        let texts = load_text_file(path)?;
+        println!(
+            "texts loaded from {} ({} lines)",
+            path.display(),
+            texts.len()
+        );
+        return Ok(TextSource::Fixed(texts));
+    }
     let charset_str = if let Some(path) = &args.charset_file {
-        load_charset_file(path)?
+        let loaded = load_charset_file(path)?;
+        println!(
+            "charset loaded from {} ({} chars)",
+            path.display(),
+            loaded.chars().count()
+        );
+        loaded
     } else {
         args.charset.clone()
     };
@@ -158,7 +210,7 @@ fn resolve_charset(args: &Args) -> Result<Vec<char>> {
     if charset.is_empty() {
         bail!("charset is empty");
     }
-    Ok(charset)
+    Ok(TextSource::Charset(charset))
 }
 
 fn random_text(rng: &mut Pcg64Mcg, charset: &[char], min: usize, max: usize) -> String {
@@ -173,7 +225,7 @@ fn generate_one(
     args: &Args,
     body: &[FontEntry],
     deco: &[FontEntry],
-    charset: &[char],
+    source: &TextSource,
     graph_cfg: &GraphConfig,
 ) -> Option<GraphSample> {
     // Independent, reproducible RNG stream per sample.
@@ -184,7 +236,15 @@ fn generate_one(
     let pool = if use_deco { deco } else { body };
     let font = &pool[rng.random_range(0..pool.len())];
 
-    let text = random_text(&mut rng, charset, args.min_chars, args.max_chars);
+    let text = match source {
+        TextSource::Charset(charset) => {
+            random_text(&mut rng, charset, args.min_chars, args.max_chars)
+        }
+        // Round-robin rather than random so every pattern gets the same
+        // number of samples; a per-pattern accuracy is only comparable when
+        // the denominators match.
+        TextSource::Fixed(texts) => texts[idx % texts.len()].clone(),
+    };
 
     let layout_cfg = LayoutConfig {
         // Bias toward squeezing so intersecting paths dominate the dataset.
@@ -222,14 +282,8 @@ fn main() -> Result<()> {
         args.deco_ratio * 100.0
     );
 
-    let charset = resolve_charset(&args)?;
-    if let Some(path) = &args.charset_file {
-        println!(
-            "charset loaded from {} ({} chars)",
-            path.display(),
-            charset.len()
-        );
-    }
+    let source = resolve_text_source(&args)?;
+    println!("text source: {}", source.describe());
 
     let graph_cfg = GraphConfig {
         sample: SampleConfig {
@@ -253,7 +307,7 @@ fn main() -> Result<()> {
             let lo = shard * args.shard_size;
             let hi = ((shard + 1) * args.shard_size).min(args.count);
             let samples: Vec<GraphSample> = (lo..hi)
-                .filter_map(|i| generate_one(i, &args, &body, &deco, &charset, &graph_cfg))
+                .filter_map(|i| generate_one(i, &args, &body, &deco, &source, &graph_cfg))
                 .collect();
 
             let payload = rmp_serde::to_vec_named(&samples)?;
@@ -298,6 +352,33 @@ mod tests {
         assert_eq!(charset, "ABC123");
 
         fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn load_text_file_keeps_lines_separate() {
+        let dir = std::env::temp_dir().join(format!("text_test_{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("texts.txt");
+        // Unlike the charset loader, lines must not be concatenated: each one
+        // is a text to render on its own.
+        fs::write(&path, "# patterns\n\nll\nrI\n\n\u{3053}\n").unwrap();
+
+        let texts = load_text_file(&path).unwrap();
+        assert_eq!(texts, vec!["ll", "rI", "\u{3053}"]);
+
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn fixed_texts_are_rendered_round_robin() {
+        // Every pattern must get the same number of samples, otherwise the
+        // per-pattern accuracies in the eval breakdown are not comparable.
+        let texts = ["ll".to_string(), "rI".to_string(), "\u{3053}".to_string()];
+        let picked: Vec<&str> = (0..7).map(|i| texts[i % texts.len()].as_str()).collect();
+        assert_eq!(
+            picked,
+            ["ll", "rI", "\u{3053}", "ll", "rI", "\u{3053}", "ll"]
+        );
     }
 
     #[test]

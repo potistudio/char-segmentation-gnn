@@ -6,12 +6,12 @@
 
 Rust(データ生成・推論)と Python(学習)のハイブリッド構成。
 
-| コンポーネント       | 言語   | 役割                                                                      |
-| -------------------- | ------ | ------------------------------------------------------------------------- |
-| `crates/glyph-core`  | Rust   | パス抽出・弧長リサンプリング・特徴量生成・KD木グラフ構築(学習/推論で共有) |
-| `crates/dataset-gen` | Rust   | 合成データセット生成(rustybuzz + ttf-parser + rayon)→ MessagePack         |
-| `training/glyph_gnn` | Python | PyG データローダー・エッジ特徴量つき GAT・Focal Loss・ONNX エクスポート   |
-| `crates/glyph-infer` | Rust   | ort による ONNX 推論・閾値判定・Union-Find 連結成分抽出                   |
+| コンポーネント       | 言語   | 役割                                                                               |
+| -------------------- | ------ | ---------------------------------------------------------------------------------- |
+| `crates/glyph-core`  | Rust   | パス抽出・弧長リサンプリング・特徴量生成・KD木グラフ構築(学習/推論で共有)          |
+| `crates/dataset-gen` | Rust   | 合成データセット生成(rustybuzz + ttf-parser + rayon)→ MessagePack                  |
+| `training/glyph_gnn` | Python | PyG データローダー・エッジ特徴量つき GAT・Focal Loss・採点/分析・ONNX エクスポート |
+| `crates/glyph-infer` | Rust   | ort による ONNX 推論・閾値判定・Union-Find 連結成分抽出                            |
 
 ## データフロー
 
@@ -55,6 +55,20 @@ cargo run --release -p dataset-gen -- \
 - `--charset` … インラインで文字集合を指定（デフォルトは英数字）
 - `--charset-file` … UTF-8 テキストファイルから文字集合を読み込み（`#` 行頭コメントと空行は無視。同一文字の重複は出現率を上げる）
 - 同梱プリセット: `charsets/ascii.txt`, `hiragana.txt`, `katakana.txt`, `kana.txt`, `japanese-basic.txt`, `japanese-mixed.txt`
+- `--text-file` … ランダム文字列の代わりに固定テキストを1行1件で読み、順番に割り当てる
+  （評価用。`--min-chars` / `--max-chars` は効かない）
+
+混同パターン評価セットの生成:
+
+```bash
+cargo run --release -p dataset-gen -- \
+    --body-fonts fonts/ja-train --deco-fonts fonts/ja-train \
+    --text-file texts/confusables.txt --count 20000 --out dataset/confusables
+```
+
+`texts/confusables.txt` は過分割・過結合が起きるパターンを集めたもの
+（`ll` `rI` `rn` / `こ` `た` `二` `一一` など）。各行が同じ回数だけ、
+別々のフォントと拡張で描かれるので、パターン別の一致率をそのまま比較できる。
 
 - 本文フォント:装飾フォント = 7:3(`--deco-ratio` で変更可)
 - データ拡張: 負のトラッキング(パス交差の生成)、ベースライン上下動、
@@ -73,12 +87,37 @@ uv run python -m glyph_gnn.train --data dataset/train --out training/checkpoints
 
 - 検証分割はデフォルトでフォント単位のホールドアウト(未学習フォント汎化を測定)
 - Focal Loss(`--focal-alpha` / `--focal-gamma`)でクラスインバランスを補正
-- ベストチェックポイントは境界クラス(負例)F1 で選択
+- **ベストチェックポイントは完全グルーピング一致率で選択**(後述)
 - 学習成果物は `training/checkpoints/<run>/` 配下にまとめる(ディレクトリごと gitignore)
 - 起動時にデータセット統計・モデル規模・ハイパーパラメータのサマリを表示し、
   シャード読み込み / エポック / バッチ / 検証の進捗バーを出す
   (パイプ出力時は自動で無効。`--no-progress` で明示的に抑止)
 - エポックごとに loss・学習率・経過時間・スループット・GPU ピークメモリ・検証指標を 1 行で出力
+
+#### 検証指標(何を測っているか)
+
+損失は点エッジ単位で計算するが、**採点は出荷される判断単位＝輪郭グループで行う**。
+この2つは大きく違う:
+
+- エッジの 75〜79% は同一輪郭内で、ラベルは例外なく陽性。しかも `same_contour` は
+  入力特徴量なので、この分は自動的に当たる
+- 独立した判断である輪郭ペアは全エッジの **0.4〜0.6%** しかない
+- 推論は輪郭ペアごとに確率を max で潰すので、偽陽性が増幅される。英数字の中央値は
+  1ペアあたり24本なので、点エッジ単位の偽陽性率 1% はペア単位で
+  `1 - 0.99^24 = 21%` になる
+
+そのため検証では以下を出す:
+
+| 指標 | 意味 |
+| --- | --- |
+| `pair F1` | 輪郭ペア単位の F1 |
+| `group` | 1グラフの分割が完全一致した割合(`@0.70` は最良閾値) |
+| `split` | 1文字の輪郭が複数グループに割れた割合(「こ」「た」の過分割) |
+| `merge` | 1グループに複数文字が混ざった割合(「ll」「rI」の過結合) |
+
+`split` と `merge` は同じ閾値の裏表なので、必ず分けて見ること。
+毎エポック閾値スイープ(既定 0.30〜0.90 の10点、`--thresholds` で変更可)を回し、
+最良閾値での一致率で `best.pt` を選ぶ。追加の順伝播は発生しない。
 
 #### GPU メモリ
 
@@ -124,6 +163,7 @@ uv run python -m glyph_gnn.train --data dataset/ja-train-packed --out training/c
 | `edge_features[2]` (`dist`) | `dx`, `dy` から f32 の同一演算で復元 | −2.62 GiB |
 | `edge_features[3]` (`same_contour`) | 0/1 なのでラベルバイトの bit 1 に格納 | −2.62 GiB |
 | `edge_index` | ノード数の最大が 3,172 なので u16 で保存 | −2.62 GiB |
+| `node_ids` | 輪郭ID・文字IDを u16 ペアで**追加**(採点に必須) | +0.18 GiB |
 
 サイズはディスク以上に重要で、12.23 GiB なら 32 GiB マシンのページキャッシュに
 ストア全体が収まる。HDD 上に置いても、ディスクから読むのは 1 エポック目だけで
@@ -133,6 +173,9 @@ HDD では、これがないと 1 エポック 38 分がディスク待ちにな
 パッキング時に `dist` の復元誤差の最大値を表示するので、可逆性が壊れれば気づける。
 フォーマットを変えたら `FORMAT_VERSION` を上げること。古いストアは
 再パックを促すエラーで弾かれる。
+
+> **v2 → v3**: 輪郭ID・文字ID(`node_ids`)を追加した。これがないと輪郭グループでの
+> 採点ができない(点エッジの代理指標しか測れない)。v2 のストアは再パックが必要。
 
 `--warm-cache` を付けるとストアを順次読みしてページキャッシュに載せてから学習に入る。
 HDD ではコールドなランダムアクセスが 9 MB/s しか出ないのに対し順次は 86 MiB/s 出るので、
@@ -149,7 +192,38 @@ epoch   2/2 | loss 0.0019 | 7m 01s | 150 graphs/s | peak 2.3GiB | val F1(neg) 0.
 2 エポック目も速度が変わらない = ディスク待ちが発生しておらず GPU 律速。
 SSD に置ける場合は `--warm-cache` は不要。
 
-### 3. ONNX エクスポート
+### 3. 評価・分析
+
+```bash
+# 混同パターン別の一致率(どのパターンで壊れているかを特定する)
+uv run python -m glyph_gnn.eval \
+    --checkpoint training/checkpoints/run/best.pt --data dataset/confusables
+
+# データセットの構造プローブ(エッジ構成・受容野・連結性の天井)
+uv run python -m glyph_gnn.analyze --data dataset/ja-train --limit 300
+
+# 採点コードの自己検査(出荷版ポストプロセッサとの一致を確認)
+uv run python -m glyph_gnn.selftest --data dataset/ja-train
+```
+
+`eval` は閾値スイープの表と、テキスト別の一致率を悪い順に出す。
+`--text-file` で作った固定テキストのシャードに対して使うと、
+「総合94%」が「`ll` を40%誤結合している」まで分解される。
+
+`analyze` は3つの構造的な問いに答える。いずれも学習ログからは見えない:
+
+1. **エッジ構成** — 損失が実際に何に使われているか(自明なエッジの割合)
+2. **受容野** — L ホップで em 単位でどこまで情報が届くか。1文字分に満たなければ、
+   隣の文字が見えていない＝文字ピッチを判断材料にできない
+3. **連結性の天井** — 1文字の輪郭同士がそもそもグラフ上で繋がっているか。
+   繋がっていなければ、どんな閾値でもモデルでもグループ化できない
+
+`selftest` は `glyph_gnn.metrics` を既知解(オラクル・全結合・全分割)と、
+`glyph-infer` の Union-Find を写した `postprocess.group_characters` の
+両方に突き合わせる。採点コードが静かにズレると以降の計測が全部狂うので、
+採点まわりを触ったら走らせること。
+
+### 4. ONNX エクスポート
 
 ```bash
 uv run python -m glyph_gnn.export_onnx --checkpoint training/checkpoints/run/best.pt --out model.onnx
@@ -158,7 +232,7 @@ uv run python -m glyph_gnn.export_onnx --checkpoint training/checkpoints/run/bes
 動的軸(ノード数・エッジ数)でエクスポートし、onnxruntime と PyTorch の
 出力一致を自動検証する。
 
-### 4. 推論(フェーズ3)
+### 5. 推論(フェーズ3)
 
 ```bash
 # デモ: テキストを密着レイアウトして分割
@@ -171,11 +245,13 @@ cargo run --release -p glyph-infer -- --model model.onnx \
 ```
 
 - 既定で CUDA Execution Provider を登録(RTX 3060)。`--cpu` で CPU 実行
-- `--threshold` でエッジ結合確率の判定閾値を調整(Union-Find は偽陽性1本で
-  グループが結合するため高めが安全。12kサンプル学習モデルの実測では
-  0.7 が最良: 未学習フォントで誤結合ゼロ・完全グルーピング 94%)
+- `--threshold` でエッジ結合確率の判定閾値を調整。Union-Find は偽陽性1本で
+  グループが結合するため高めが安全だが、上げすぎると今度は「こ」の上下の画のような
+  弱い長距離リンクが落ちる。**このモデル用の値は学習ログの閾値スイープか
+  `glyph_gnn.eval` で決めること**
+  (0.7 は 12k サンプル学習モデル時代の値で、モデルを変えたら当てにならない)
 
-### 5. インタラクティブ GUI
+### 6. インタラクティブ GUI
 
 ```bash
 cargo build --release -p glyph-infer

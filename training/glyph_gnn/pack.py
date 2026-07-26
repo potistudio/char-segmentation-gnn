@@ -16,6 +16,12 @@ store by 40% (20.09 -> 12.23 GiB for ja-train) without losing anything:
 * Node ids fit in u16 (the widest glyph graph has ~3.2k nodes), which the
   packer verifies per sample.
 
+``node_ids`` carries the per-node contour and character ids as an interleaved
+u16 pair. They are what the shipping decision is actually made over --
+``group_characters`` collapses point edges to contour pairs -- so without them
+training can only score the point-edge proxy. At 4 bytes per node they cost
+~187 MiB on ja-train (+1.5%).
+
 Size matters beyond disk: at 12.23 GiB the whole store stays in the OS page
 cache on a 32 GiB host, so training reads it from disk once instead of
 seeking per batch.
@@ -36,16 +42,19 @@ import numpy as np
 from tqdm.auto import tqdm
 
 INDEX_NAME = "index.npz"
-FORMAT_VERSION = 2
+FORMAT_VERSION = 3
 # Node/edge feature layout produced by crates/glyph-core/src/graph.rs.
 EDGE_DIM = 4
 DX, DY, DIST, SAME_CONTOUR = range(EDGE_DIM)
 LABEL_BIT, SAME_CONTOUR_BIT = 1, 2
+# Columns of the interleaved node_ids stream.
+CONTOUR_ID, CHAR_ID = 0, 1
 STREAMS = {
     "x": ("x.f32", np.float32),
     "edge_index": ("edge_index.u16", np.uint16),
     "edge_delta": ("edge_delta.f32", np.float32),
     "flags": ("flags.u8", np.uint8),
+    "node_ids": ("node_ids.u16", np.uint16),
 }
 
 
@@ -75,6 +84,8 @@ def encode(sample: dict) -> tuple[dict[str, np.ndarray], float]:
     edge_index = np.asarray(sample["edge_index"], dtype=np.uint32)
     features = np.asarray(sample["edge_features"], dtype=np.float32).reshape(-1, EDGE_DIM)
     labels = np.asarray(sample["edge_labels"], dtype=np.uint8)
+    contour_ids = np.asarray(sample["node_contour_ids"], dtype=np.int64)
+    char_ids = np.asarray(sample["node_char_ids"], dtype=np.int64)
 
     e = labels.size
     if x.size != n * node_dim:
@@ -85,6 +96,13 @@ def encode(sample: dict) -> tuple[dict[str, np.ndarray], float]:
         raise ValueError("edge feature size mismatch")
     if edge_index.size and edge_index.max() >= n:
         raise ValueError("edge index out of range")
+    if contour_ids.size != n or char_ids.size != n:
+        raise ValueError("node id size mismatch")
+    # UNKNOWN_CHAR (u32::MAX) only appears at inference time; a shard carrying
+    # it is not trainable data, and it would silently truncate to u16.
+    widest = max(int(contour_ids.max(initial=0)), int(char_ids.max(initial=0)))
+    if widest > np.iinfo(np.uint16).max:
+        raise ValueError(f"node id {widest} exceeds the u16 range (unlabeled shard?)")
 
     same = features[:, SAME_CONTOUR]
     if not np.isin(same, (0.0, 1.0)).all():
@@ -100,6 +118,7 @@ def encode(sample: dict) -> tuple[dict[str, np.ndarray], float]:
         "edge_delta": delta.ravel(),
         "flags": (labels * LABEL_BIT
                   + same.astype(np.uint8) * SAME_CONTOUR_BIT).astype(np.uint8, copy=False),
+        "node_ids": np.stack([contour_ids, char_ids], axis=1).astype(np.uint16).ravel(),
     }
     return streams, drift
 

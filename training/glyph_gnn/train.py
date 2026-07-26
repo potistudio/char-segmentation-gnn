@@ -1,4 +1,9 @@
-"""Training loop (Phase 2): focal loss, F1-based validation, best-checkpoint save.
+"""Training loop (Phase 2): focal loss, grouping-based validation, best-checkpoint save.
+
+Validation scores the decision that ships -- contour groups -- rather than the
+point-edge proxy the loss is computed on; see :mod:`glyph_gnn.metrics` for why
+the two are far apart. The best checkpoint is chosen by exact grouping
+accuracy at its best threshold.
 
 Usage:
     python -m glyph_gnn.train --data ../dataset/train --out checkpoints/run
@@ -15,6 +20,7 @@ from tqdm.auto import tqdm
 
 from .dataset import graph_stats, load_dataset, load_packed, make_loader
 from .loss import focal_loss
+from .metrics import DEFAULT_THRESHOLDS, GroupingEvaluator, format_sweep
 from .model import GlyphEdgeGNN
 from .pack import is_packed
 
@@ -27,7 +33,8 @@ def format_duration(seconds: float) -> str:
     return f"{hours}h {minutes:02d}m {secs:02d}s" if hours else f"{minutes}m {secs:02d}s"
 
 
-def print_run_summary(args, model, train_stats, val_stats, steps_per_epoch) -> None:
+def print_run_summary(args, model, train_stats, val_stats, steps_per_epoch,
+                      thresholds) -> None:
     params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     device_label = args.device
     if torch.device(args.device).type == "cuda":
@@ -65,7 +72,9 @@ def print_run_summary(args, model, train_stats, val_stats, steps_per_epoch) -> N
         ("val", val_row),
         ("model", model_row),
         ("optimizer", optim_row),
-        ("loss", f"focal alpha {args.focal_alpha} gamma {args.focal_gamma}"),
+        ("loss", f"focal alpha {args.focal_alpha} gamma {args.focal_gamma} (point edges)"),
+        ("select", "exact grouping accuracy over contour groups, best of"
+                   f" {len(thresholds)} thresholds"),
         ("schedule", schedule_row),
         ("output", str(Path(args.out))),
     ]
@@ -86,9 +95,17 @@ def release(device) -> None:
 
 
 @torch.no_grad()
-def evaluate(model, loader, device, threshold: float = 0.5, alpha: float = 0.25,
-             gamma: float = 2.0, progress: bool = True) -> dict:
+def evaluate(model, loader, device, alpha: float = 0.25, gamma: float = 2.0,
+             thresholds=DEFAULT_THRESHOLDS, progress: bool = True) -> dict:
+    """Runs one validation pass and scores it at every threshold.
+
+    Contour-pair probabilities are accumulated once and swept afterwards, so
+    the sweep costs no extra forward passes. The point-edge scores are kept
+    alongside for continuity with older runs, but they are not what selects
+    the checkpoint: 75-79% of edges are intra-contour and trivially positive.
+    """
     model.eval()
+    grouping = GroupingEvaluator()
     tp = fp = fn = tn = 0
     total_loss = 0.0
     graphs = 0
@@ -105,21 +122,22 @@ def evaluate(model, loader, device, threshold: float = 0.5, alpha: float = 0.25,
             continue
         total_loss += loss.item() * batch.num_graphs
         graphs += batch.num_graphs
-        pred = (torch.sigmoid(logits) >= threshold).float()
+        probs = torch.sigmoid(logits)
+        grouping.add(batch, probs)
+        pred = (probs >= 0.5).float()
         y = batch.y
         tp += int(((pred == 1) & (y == 1)).sum())
         fp += int(((pred == 1) & (y == 0)).sum())
         fn += int(((pred == 0) & (y == 1)).sum())
         tn += int(((pred == 0) & (y == 0)).sum())
-    precision = tp / (tp + fp) if tp + fp else 0.0
-    recall = tp / (tp + fn) if tp + fn else 0.0
-    f1 = 2 * precision * recall / (precision + recall) if precision + recall else 0.0
-    # Negative-class F1 matters most: negatives are the character boundaries.
+    # Negative-class F1 on point edges: the old selection metric, now a diagnostic.
     prec_n = tn / (tn + fn) if tn + fn else 0.0
     rec_n = tn / (tn + fp) if tn + fp else 0.0
     f1_n = 2 * prec_n * rec_n / (prec_n + rec_n) if prec_n + rec_n else 0.0
-    return {"precision": precision, "recall": recall, "f1": f1, "f1_neg": f1_n,
-            "accuracy": (tp + tn) / max(tp + tn + fp + fn, 1),
+
+    sweep = grouping.sweep(thresholds)
+    best = max(sweep, key=lambda m: (m["grouping_acc"], m["threshold"]))
+    return {**best, "sweep": sweep, "edge_f1_neg": f1_n,
             "loss": total_loss / max(graphs, 1)}
 
 
@@ -139,6 +157,9 @@ def main() -> None:
     ap.add_argument("--dropout", type=float, default=0.1)
     ap.add_argument("--focal-alpha", type=float, default=0.25)
     ap.add_argument("--focal-gamma", type=float, default=2.0)
+    ap.add_argument("--thresholds", default=None,
+                    help="comma-separated grouping thresholds to sweep each epoch"
+                         f" (default {','.join(str(t) for t in DEFAULT_THRESHOLDS)})")
     ap.add_argument("--val-frac", type=float, default=0.1)
     ap.add_argument("--random-split", action="store_true", help="split by sample instead of by font")
     ap.add_argument("--limit-shards", type=int, default=None,
@@ -160,6 +181,8 @@ def main() -> None:
     progress = not args.no_progress
     torch.manual_seed(args.seed)
     device = torch.device(args.device)
+    thresholds = (tuple(float(t) for t in args.thresholds.split(","))
+                  if args.thresholds else DEFAULT_THRESHOLDS)
 
     packed = is_packed(args.data)
     if packed:
@@ -208,12 +231,13 @@ def main() -> None:
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(optim, T_max=args.epochs)
 
     print_run_summary(args, model, graph_stats(train_set), graph_stats(val_set),
-                      len(train_loader))
+                      len(train_loader), thresholds)
 
     out_dir = Path(args.out)
     out_dir.mkdir(parents=True, exist_ok=True)
-    best_f1 = -1.0
+    best_score = -1.0
     best_epoch = 0
+    metrics: dict = {}
     started = time.time()
 
     epochs = tqdm(range(1, args.epochs + 1), desc="epochs", unit="epoch",
@@ -255,14 +279,15 @@ def main() -> None:
         sched.step()
 
         metrics = evaluate(model, val_loader, device, alpha=args.focal_alpha,
-                           gamma=args.focal_gamma, progress=progress) if val_set else {}
+                           gamma=args.focal_gamma, thresholds=thresholds,
+                           progress=progress) if val_set else {}
         avg_loss = total_loss / max(seen, 1)
         elapsed = time.time() - t0
 
-        score = metrics.get("f1_neg", -avg_loss)
-        is_best = score > best_f1
+        score = metrics.get("grouping_acc", -avg_loss)
+        is_best = score > best_score
         if is_best:
-            best_f1, best_epoch = score, epoch
+            best_score, best_epoch = score, epoch
             torch.save(
                 {"state_dict": model.state_dict(), "hparams": model.hparams, "epoch": epoch,
                  "metrics": metrics},
@@ -276,22 +301,28 @@ def main() -> None:
             torch.cuda.reset_peak_memory_stats(device)
         if metrics:
             line += (
-                f" | val loss {metrics['loss']:.4f} P {metrics['precision']:.4f}"
-                f" R {metrics['recall']:.4f} F1 {metrics['f1']:.4f}"
-                f" F1(neg) {metrics['f1_neg']:.4f}"
+                f" | val loss {metrics['loss']:.4f} | pair F1 {metrics['pair_f1']:.4f}"
+                f" | group {metrics['grouping_acc']:.4f} @{metrics['threshold']:.2f}"
+                f" | split {metrics['char_split_rate']:.4f}"
+                f" merge {metrics['char_merge_rate']:.4f}"
             )
         if is_best:
             line += "  <- best"
         tqdm.write(line)
-        epochs.set_postfix(best=f"{best_f1:.4f}", refresh=False)
+        epochs.set_postfix(best=f"{best_score:.4f}", refresh=False)
     epochs.close()
+
+    if metrics:
+        print("\nthreshold sweep (final epoch):")
+        print(format_sweep(metrics["sweep"]))
 
     torch.save(
         {"state_dict": model.state_dict(), "hparams": model.hparams, "epoch": args.epochs},
         out_dir / "last.pt",
     )
-    print(f"finished {args.epochs} epochs in {format_duration(time.time() - started)}")
-    print(f"best F1(neg) = {best_f1:.4f} @ epoch {best_epoch} -> {out_dir / 'best.pt'}")
+    print(f"\nfinished {args.epochs} epochs in {format_duration(time.time() - started)}")
+    print(f"best grouping accuracy = {best_score:.4f} @ epoch {best_epoch}"
+          f" -> {out_dir / 'best.pt'}")
     print(f"final weights -> {out_dir / 'last.pt'}")
 
 
