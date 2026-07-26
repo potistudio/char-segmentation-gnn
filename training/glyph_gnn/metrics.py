@@ -31,6 +31,9 @@ import torch
 #: Thresholds swept by default. ``group_characters`` needs a high threshold to
 #: survive max pooling, so the grid is dense at the top.
 DEFAULT_THRESHOLDS = (0.3, 0.4, 0.5, 0.6, 0.65, 0.7, 0.75, 0.8, 0.85, 0.9)
+#: Merge probabilities swept by the greedy decoder. Its scorer answers a
+#: different question from the edge model's, so it needs its own grid.
+DEFAULT_MARGINS = (0.3, 0.4, 0.5, 0.6, 0.7, 0.8)
 
 
 def contour_pair_index(contour_id: torch.Tensor, edge_index: torch.Tensor):
@@ -85,11 +88,109 @@ def _components(num_contours: int, a: np.ndarray, b: np.ndarray) -> np.ndarray:
                        count=num_contours)
 
 
+def contour_owners(contour_id: torch.Tensor, char_id: torch.Tensor,
+                   batch: torch.Tensor | None):
+    """Per-contour character and graph, from the per-node labels.
+
+    Every node of a contour carries the same pair, so an arbitrary winner among
+    the duplicates is the right answer.
+    """
+    contours = int(contour_id.max()) + 1 if contour_id.numel() else 0
+    owner = (batch if batch is not None
+             else torch.zeros_like(contour_id))
+    contour_char = contour_id.new_zeros(contours).scatter_(0, contour_id, char_id)
+    contour_graph = contour_id.new_zeros(contours).scatter_(0, contour_id, owner)
+    return contour_char, contour_graph, contours
+
+
+def partition_metrics(group: np.ndarray, char: np.ndarray, contour_graph: np.ndarray,
+                      num_graphs: int, per_graph: bool = False) -> dict:
+    """Compares a predicted contour partition against the character partition.
+
+    Shared by the union-find decoder and the greedy one so their numbers mean
+    the same thing. Both partitions are graph-local, so a graph is correct
+    exactly when its group count, its character count and the count of their
+    common refinement agree -- that is, when neither splits nor merges the other.
+    """
+    group, num_groups = _dense(group)
+    char, num_chars = _dense(char)
+    joint, num_joint = _dense(group.astype(np.int64) * max(num_chars, 1) + char)
+
+    def per_graph_counts(dense: np.ndarray, count: int) -> np.ndarray:
+        """Number of cells each graph owns; cells never span graphs."""
+        owner = np.zeros(count, dtype=np.int64)
+        owner[dense] = contour_graph
+        return np.bincount(owner, minlength=num_graphs)
+
+    groups_per_graph = per_graph_counts(group, num_groups)
+    chars_per_graph = per_graph_counts(char, num_chars)
+    joint_per_graph = per_graph_counts(joint, num_joint)
+    correct = (joint_per_graph == groups_per_graph) & (joint_per_graph == chars_per_graph)
+
+    # Decompose the failures. Each (group, character) cell of the joint
+    # partition tells us how a character was cut up and what a group holds.
+    cell_group = np.zeros(num_joint, dtype=np.int64)
+    cell_char = np.zeros(num_joint, dtype=np.int64)
+    cell_group[joint] = group
+    cell_char[joint] = char
+    groups_per_char = np.bincount(cell_char, minlength=num_chars)
+    chars_per_group = np.bincount(cell_group, minlength=num_groups)
+
+    split = groups_per_char > 1
+    merged = np.zeros(num_chars, dtype=bool)
+    np.logical_or.at(merged, cell_char, chars_per_group[cell_group] > 1)
+
+    out = {
+        "grouping_acc": float(correct.mean()) if num_graphs else 0.0,
+        "char_split_rate": float(split.mean()) if num_chars else 0.0,
+        "char_merge_rate": float(merged.mean()) if num_chars else 0.0,
+        "chars": int(num_chars),
+        "graphs": int(num_graphs),
+    }
+    if per_graph:
+        out["correct"] = correct
+    return out
+
+
 def _dense(values: np.ndarray) -> tuple[np.ndarray, int]:
     """Relabels arbitrary ids to ``0..k-1`` and returns the count."""
     _, inverse = np.unique(values, return_inverse=True)
     inverse = np.asarray(inverse).ravel()
     return inverse, (int(inverse.max()) + 1 if inverse.size else 0)
+
+
+class PartitionAccumulator:
+    """Collects decoded partitions across batches and scores them at the end.
+
+    The greedy decoder produces a partition per batch rather than pair scores,
+    so it cannot use :class:`GroupingEvaluator`'s deferred sweep; this keeps the
+    pieces disjoint across batches so one call scores the whole pass.
+    """
+
+    def __init__(self) -> None:
+        self._group: list[np.ndarray] = []
+        self._char: list[np.ndarray] = []
+        self._graph: list[np.ndarray] = []
+        self._contour_base = 0
+        self._char_base = 0
+        self._graph_base = 0
+
+    def add(self, root: np.ndarray, contour_char: torch.Tensor,
+            contour_graph: torch.Tensor, num_graphs: int) -> None:
+        char = contour_char.cpu().numpy()
+        self._group.append(root + self._contour_base)
+        self._char.append(char + self._char_base)
+        self._graph.append(contour_graph.cpu().numpy() + self._graph_base)
+        self._contour_base += root.size
+        self._char_base += int(char.max()) + 1 if char.size else 0
+        self._graph_base += num_graphs
+
+    def score(self, per_graph: bool = False) -> dict:
+        if not self._group:
+            return partition_metrics(np.empty(0, np.int64), np.empty(0, np.int64),
+                                     np.empty(0, np.int64), 0, per_graph)
+        return partition_metrics(np.concatenate(self._group), np.concatenate(self._char),
+                                 np.concatenate(self._graph), self._graph_base, per_graph)
 
 
 class GroupingEvaluator:
@@ -120,13 +221,9 @@ class GroupingEvaluator:
     def add(self, batch, probs: torch.Tensor) -> None:
         """Folds one batch of point-edge probabilities into contour pairs."""
         contour_id, char_id = batch.contour_id, batch.char_id
-        num_contours = int(contour_id.max()) + 1 if contour_id.numel() else 0
         num_chars = int(char_id.max()) + 1 if char_id.numel() else 0
-
-        # Every node of a contour carries the same character and graph, so an
-        # arbitrary winner among the duplicates is the right answer.
-        contour_char = contour_id.new_zeros(num_contours).scatter_(0, contour_id, char_id)
-        contour_graph = contour_id.new_zeros(num_contours).scatter_(0, contour_id, batch.batch)
+        contour_char, contour_graph, num_contours = contour_owners(
+            contour_id, char_id, batch.batch)
 
         # One row per undirected contour pair; both stored directions and every
         # point edge between the two contours collapse into it by max, exactly
@@ -175,55 +272,12 @@ class GroupingEvaluator:
         recall = tp / (tp + fn) if tp + fn else 0.0
         f1 = 2 * precision * recall / (precision + recall) if precision + recall else 0.0
 
-        root = _components(num_contours, a[predicted], b[predicted])
         # Both partitions are graph-local: components never span graphs, and
         # character ids were made disjoint per graph by GlyphData.__inc__.
-        group, num_groups = _dense(root)
-        char, num_chars = _dense(contour_char)
-
-        # A grouping is correct exactly when the group partition and the
-        # character partition have the same number of cells as their common
-        # refinement -- i.e. neither splits nor merges the other.
-        joint, num_joint = _dense(group.astype(np.int64) * max(num_chars, 1) + char)
-
-        def per_graph_counts(dense: np.ndarray, count: int) -> np.ndarray:
-            """Number of cells each graph owns; cells never span graphs."""
-            owner = np.zeros(count, dtype=np.int64)
-            owner[dense] = contour_graph
-            return np.bincount(owner, minlength=num_graphs)
-
-        groups_per_graph = per_graph_counts(group, num_groups)
-        chars_per_graph = per_graph_counts(char, num_chars)
-        joint_per_graph = per_graph_counts(joint, num_joint)
-        correct = (joint_per_graph == groups_per_graph) & (joint_per_graph == chars_per_graph)
-
-        # Decompose the failures. Each (group, character) cell of the joint
-        # partition tells us how a character was cut up and what a group holds.
-        cell_group = np.zeros(num_joint, dtype=np.int64)
-        cell_char = np.zeros(num_joint, dtype=np.int64)
-        cell_group[joint] = group
-        cell_char[joint] = char
-        groups_per_char = np.bincount(cell_char, minlength=num_chars)
-        chars_per_group = np.bincount(cell_group, minlength=num_groups)
-
-        split = groups_per_char > 1
-        merged = np.zeros(num_chars, dtype=bool)
-        np.logical_or.at(merged, cell_char, chars_per_group[cell_group] > 1)
-
-        out = {
-            "threshold": threshold,
-            "pair_precision": precision,
-            "pair_recall": recall,
-            "pair_f1": f1,
-            "pairs": int(prob.size),
-            "grouping_acc": float(correct.mean()) if num_graphs else 0.0,
-            "char_split_rate": float(split.mean()) if num_chars else 0.0,
-            "char_merge_rate": float(merged.mean()) if num_chars else 0.0,
-            "chars": int(num_chars),
-            "graphs": int(num_graphs),
-        }
-        if per_graph:
-            out["correct"] = correct
+        root = _components(num_contours, a[predicted], b[predicted])
+        out = partition_metrics(root, contour_char, contour_graph, num_graphs, per_graph)
+        out.update(threshold=threshold, pair_precision=precision, pair_recall=recall,
+                   pair_f1=f1, pairs=int(prob.size))
         return out
 
     def sweep(self, thresholds=DEFAULT_THRESHOLDS) -> list[dict]:
@@ -238,6 +292,20 @@ class GroupingEvaluator:
         """
         return max(self.sweep(thresholds),
                    key=lambda m: (m["grouping_acc"], m["threshold"]))
+
+
+def format_greedy(sweep: list[dict]) -> str:
+    """Renders a greedy min-score sweep as a fixed-width table."""
+    header = f"{'merge':>7} {'group acc':>10} {'split':>8} {'merge':>8}"
+    lines = [header, "-" * len(header)]
+    best = max(sweep, key=lambda m: (m["grouping_acc"], m["margin"])) if sweep else None
+    for m in sweep:
+        mark = "  <- best" if m is best else ""
+        lines.append(
+            f"{m['margin']:>7.2f} {m['grouping_acc']:>10.4f}"
+            f" {m['char_split_rate']:>8.4f} {m['char_merge_rate']:>8.4f}{mark}"
+        )
+    return "\n".join(lines)
 
 
 def format_sweep(sweep: list[dict]) -> str:
