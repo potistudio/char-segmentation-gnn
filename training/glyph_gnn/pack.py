@@ -42,9 +42,11 @@ import numpy as np
 from tqdm.auto import tqdm
 
 INDEX_NAME = "index.npz"
-FORMAT_VERSION = 3
+# 4: added the per-contour supernode features.
+FORMAT_VERSION = 4
 # Node/edge feature layout produced by crates/glyph-core/src/graph.rs.
 EDGE_DIM = 4
+CONTOUR_DIM = 8
 DX, DY, DIST, SAME_CONTOUR = range(EDGE_DIM)
 LABEL_BIT, SAME_CONTOUR_BIT = 1, 2
 # Columns of the interleaved node_ids stream.
@@ -55,6 +57,7 @@ STREAMS = {
     "edge_delta": ("edge_delta.f32", np.float32),
     "flags": ("flags.u8", np.uint8),
     "node_ids": ("node_ids.u16", np.uint16),
+    "contour_features": ("contour_features.f32", np.float32),
 }
 
 
@@ -84,6 +87,8 @@ def encode(sample: dict) -> tuple[dict[str, np.ndarray], float]:
     edge_index = np.asarray(sample["edge_index"], dtype=np.uint32)
     features = np.asarray(sample["edge_features"], dtype=np.float32).reshape(-1, EDGE_DIM)
     labels = np.asarray(sample["edge_labels"], dtype=np.uint8)
+    contour_features = np.asarray(sample["contour_features"], dtype=np.float32)
+    num_contours, contour_dim = sample["num_contours"], sample["contour_dim"]
     contour_ids = np.asarray(sample["node_contour_ids"], dtype=np.int64)
     char_ids = np.asarray(sample["node_char_ids"], dtype=np.int64)
 
@@ -98,6 +103,12 @@ def encode(sample: dict) -> tuple[dict[str, np.ndarray], float]:
         raise ValueError("edge index out of range")
     if contour_ids.size != n or char_ids.size != n:
         raise ValueError("node id size mismatch")
+    if contour_dim != CONTOUR_DIM:
+        raise ValueError(f"expected {CONTOUR_DIM} contour features, got {contour_dim}")
+    if contour_features.size != num_contours * contour_dim:
+        raise ValueError("contour feature size mismatch")
+    if num_contours and int(contour_ids.max()) >= num_contours:
+        raise ValueError("contour id has no supernode row")
     # UNKNOWN_CHAR (u32::MAX) only appears at inference time; a shard carrying
     # it is not trainable data, and it would silently truncate to u16.
     widest = max(int(contour_ids.max(initial=0)), int(char_ids.max(initial=0)))
@@ -119,6 +130,7 @@ def encode(sample: dict) -> tuple[dict[str, np.ndarray], float]:
         "flags": (labels * LABEL_BIT
                   + same.astype(np.uint8) * SAME_CONTOUR_BIT).astype(np.uint8, copy=False),
         "node_ids": np.stack([contour_ids, char_ids], axis=1).astype(np.uint16).ravel(),
+        "contour_features": contour_features,
     }
     return streams, drift
 
@@ -137,6 +149,7 @@ def pack_dataset(src: str | Path, dst: str | Path, limit_shards: int | None = No
 
     num_nodes: list[int] = []
     num_edges: list[int] = []
+    num_contours: list[int] = []
     positives: list[int] = []
     fonts: list[str] = []
     texts: list[str] = []
@@ -169,6 +182,7 @@ def pack_dataset(src: str | Path, dst: str | Path, limit_shards: int | None = No
                 drift = max(drift, sample_drift)
                 num_nodes.append(s["num_nodes"])
                 num_edges.append(streams["flags"].size)
+                num_contours.append(s["num_contours"])
                 positives.append(int((streams["flags"] & LABEL_BIT).sum()))
                 fonts.append(s.get("font", ""))
                 texts.append(s.get("text", ""))
@@ -178,9 +192,10 @@ def pack_dataset(src: str | Path, dst: str | Path, limit_shards: int | None = No
     np.savez(
         dst / INDEX_NAME,
         version=np.array(FORMAT_VERSION, dtype=np.uint32),
-        dims=np.array((node_dim, EDGE_DIM), dtype=np.uint32),
+        dims=np.array((node_dim, EDGE_DIM, CONTOUR_DIM), dtype=np.uint32),
         num_nodes=np.array(num_nodes, dtype=np.uint32),
         num_edges=np.array(num_edges, dtype=np.uint32),
+        num_contours=np.array(num_contours, dtype=np.uint32),
         positives=np.array(positives, dtype=np.uint32),
         fonts=names,
         font_id=font_id.astype(np.uint32),

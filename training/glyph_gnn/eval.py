@@ -43,7 +43,8 @@ def run(model, loader, device, progress: bool = True) -> GroupingEvaluator:
     bar = tqdm(loader, desc="evaluating", unit="batch", disable=None if progress else True)
     for batch in bar:
         batch = batch.to(device)
-        logits = model(batch.x, batch.edge_index, batch.edge_attr)
+        logits = model(batch.x, batch.edge_index, batch.edge_attr,
+                       batch.contour_id, batch.contour_attr, batch.batch)
         grouping.add(batch, torch.sigmoid(logits))
     bar.close()
     return grouping

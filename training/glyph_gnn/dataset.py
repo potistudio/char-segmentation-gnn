@@ -55,12 +55,16 @@ class GlyphData(Data):
         return super().__inc__(key, value, *args, **kwargs)
 
 
-def make_data(x, edge_index, edge_attr, y, contour_id, char_id) -> GlyphData:
+def make_data(x, edge_index, edge_attr, y, contour_id, char_id,
+              contour_attr) -> GlyphData:
     """Builds one graph, deriving the id ranges the batcher needs."""
     data = GlyphData(x=x, edge_index=edge_index, edge_attr=edge_attr, y=y)
     data.contour_id = contour_id
     data.char_id = char_id
-    data.num_contours = int(contour_id.max()) + 1 if contour_id.numel() else 0
+    data.contour_attr = contour_attr
+    # contour_id indexes contour_attr, so the namespace is its row count --
+    # not max()+1, which would drift on a contour that lost all its samples.
+    data.num_contours = int(contour_attr.shape[0])
     data.num_chars = int(char_id.max()) + 1 if char_id.numel() else 0
     return data
 
@@ -82,6 +86,8 @@ def load_shard(path: Path) -> list[GlyphData]:
             y=torch.tensor(s["edge_labels"], dtype=torch.float32),
             contour_id=torch.tensor(s["node_contour_ids"], dtype=torch.long),
             char_id=torch.tensor(s["node_char_ids"], dtype=torch.long),
+            contour_attr=torch.tensor(s["contour_features"], dtype=torch.float32)
+            .view(s["num_contours"], s["contour_dim"]),
         )
         data.font = s.get("font", "")
         data.text = s.get("text", "")
@@ -145,6 +151,13 @@ def dataset_node_dim(graphs) -> int:
     return int(graphs[0].x.shape[1])
 
 
+def dataset_contour_dim(graphs) -> int:
+    """Width of the per-contour supernode features the store carries."""
+    if hasattr(graphs, "contour_dim"):
+        return int(graphs.contour_dim)
+    return int(graphs[0].contour_attr.shape[1])
+
+
 def graph_stats(graphs) -> dict:
     """Summarizes a dataset without materializing it when it is packed."""
     if hasattr(graphs, "stats"):
@@ -181,9 +194,10 @@ class PackedGlyphDataset(torch.utils.data.Dataset):
                 f"{self.root} uses packed format v{version}, this build reads "
                 f"v{FORMAT_VERSION}; re-run glyph_gnn.pack"
             )
-        self.node_dim, self.edge_dim = (int(v) for v in index["dims"])
+        self.node_dim, self.edge_dim, self.contour_dim = (int(v) for v in index["dims"])
         self.num_nodes = index["num_nodes"].astype(np.int64)
         self.num_edges = index["num_edges"].astype(np.int64)
+        self.num_contours = index["num_contours"].astype(np.int64)
         self.positives = index["positives"].astype(np.int64)
         self.fonts = index["fonts"][index["font_id"]]
         self.texts = index["texts"]
@@ -193,6 +207,7 @@ class PackedGlyphDataset(torch.utils.data.Dataset):
             "edge_delta": _starts(self.num_edges * 2),
             "flags": _starts(self.num_edges),
             "node_ids": _starts(self.num_nodes * 2),
+            "contour_features": _starts(self.num_contours * self.contour_dim),
         }
         self.ids = (np.arange(len(self.num_nodes), dtype=np.int64) if ids is None
                     else np.asarray(ids, dtype=np.int64))
@@ -239,6 +254,8 @@ class PackedGlyphDataset(torch.utils.data.Dataset):
         n, e = int(self.num_nodes[gid]), int(self.num_edges[gid])
         flags = self._read("flags", gid, e)
         node_ids = self._read("node_ids", gid, n * 2).reshape(n, 2).astype(np.int64)
+        c = int(self.num_contours[gid])
+        contour_attr = self._read("contour_features", gid, c * self.contour_dim)
         data = make_data(
             x=torch.from_numpy(
                 self._read("x", gid, n * self.node_dim).copy()
@@ -251,6 +268,7 @@ class PackedGlyphDataset(torch.utils.data.Dataset):
             y=torch.from_numpy(((flags & LABEL_BIT) != 0).astype(np.float32)),
             contour_id=torch.from_numpy(node_ids[:, CONTOUR_ID].copy()),
             char_id=torch.from_numpy(node_ids[:, CHAR_ID].copy()),
+            contour_attr=torch.from_numpy(contour_attr.copy()).view(c, self.contour_dim),
         )
         data.font = str(self.fonts[gid])
         data.text = str(self.texts[gid])

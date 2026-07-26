@@ -19,6 +19,7 @@ import torch
 from tqdm.auto import tqdm
 
 from .dataset import (
+    dataset_contour_dim,
     dataset_node_dim,
     graph_stats,
     load_dataset,
@@ -74,6 +75,7 @@ def print_run_summary(args, model, train_stats, val_stats, steps_per_epoch,
         f"hidden {args.hidden} | layers {args.layers} | heads {args.heads}"
         f" | dropout {args.dropout}"
         f" | global context {'off' if args.no_global_context else 'on'}"
+        f" | contour layers {'off' if args.no_contour_layers else 'on'}"
         f" | {params:,} params"
     )
     optim_row = (
@@ -139,7 +141,8 @@ def evaluate(model, loader, device, settings: dict,
     for batch in bar:
         batch = batch.to(device)
         try:
-            logits = model(batch.x, batch.edge_index, batch.edge_attr, batch.batch)
+            logits = model(batch.x, batch.edge_index, batch.edge_attr,
+                           batch.contour_id, batch.contour_attr, batch.batch)
             loss, _ = glyph_loss(logits, batch.y, batch.contour_id, batch.edge_index,
                                  **settings)
         except torch.OutOfMemoryError:
@@ -181,6 +184,9 @@ def main() -> None:
     ap.add_argument("--layers", type=int, default=4)
     ap.add_argument("--heads", type=int, default=4)
     ap.add_argument("--dropout", type=float, default=0.1)
+    ap.add_argument("--no-contour-layers", action="store_true",
+                    help="drop the contour supernode rounds; an ablation, since they"
+                         " are what carries information past ~0.5 em")
     ap.add_argument("--no-global-context", action="store_true",
                     help="drop the graph-level summary from the edge classifier;"
                          " an ablation, since four hops only reach ~0.5 em")
@@ -264,8 +270,9 @@ def main() -> None:
                              num_workers=workers)
 
     model = GlyphEdgeGNN(
-        node_dim=dataset_node_dim(train_set), hidden=args.hidden, layers=args.layers,
-        heads=args.heads, dropout=args.dropout, context=not args.no_global_context
+        node_dim=dataset_node_dim(train_set), contour_dim=dataset_contour_dim(train_set),
+        hidden=args.hidden, layers=args.layers, heads=args.heads, dropout=args.dropout,
+        context=not args.no_global_context, contours=not args.no_contour_layers,
     ).to(device)
     model.hparams.update(
         knn=args.knn,
@@ -301,7 +308,8 @@ def main() -> None:
             batch = batch.to(device)
             optim.zero_grad(set_to_none=True)
             try:
-                logits = model(batch.x, batch.edge_index, batch.edge_attr, batch.batch)
+                logits = model(batch.x, batch.edge_index, batch.edge_attr,
+                           batch.contour_id, batch.contour_attr, batch.batch)
                 loss, terms = glyph_loss(logits, batch.y, batch.contour_id,
                                          batch.edge_index, **settings)
                 loss.backward()

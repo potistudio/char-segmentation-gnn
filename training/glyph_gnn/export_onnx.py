@@ -23,15 +23,24 @@ class InferenceWrapper(torch.nn.Module):
         super().__init__()
         self.model = model
 
-    def forward(self, node_features, edge_index, edge_features):
-        return torch.sigmoid(self.model(node_features, edge_index, edge_features))
+    def forward(self, node_features, edge_index, edge_features,
+                node_contour_ids, contour_features):
+        # batch stays None: inference runs one line at a time, so every
+        # pooling reduces over the whole input and needs no graph vector.
+        return torch.sigmoid(self.model(node_features, edge_index, edge_features,
+                                        node_contour_ids, contour_features))
 
 
-def make_dummy_inputs(node_dim: int, edge_dim: int, n: int = 50, e: int = 200):
+def make_dummy_inputs(node_dim: int, edge_dim: int, contour_dim: int,
+                      n: int = 50, e: int = 200, c: int = 7):
     x = torch.randn(n, node_dim)
     edge_index = torch.randint(0, n, (2, e), dtype=torch.long)
     edge_attr = torch.randn(e, edge_dim)
-    return x, edge_index, edge_attr
+    # Every contour must own at least one node, or its supernode row is a
+    # mean over nothing; the real builder guarantees that.
+    contour_id = torch.cat([torch.arange(c), torch.randint(0, c, (n - c,))]).long()
+    contour_attr = torch.randn(c, contour_dim)
+    return x, edge_index, edge_attr, contour_id, contour_attr
 
 
 def main() -> None:
@@ -55,18 +64,22 @@ def main() -> None:
 
     node_dim = hparams["node_dim"]
     edge_dim = hparams["edge_dim"]
-    dummy = make_dummy_inputs(node_dim, edge_dim)
+    contour_dim = hparams.get("contour_dim", 8)
+    dummy = make_dummy_inputs(node_dim, edge_dim, contour_dim)
 
     torch.onnx.export(
         wrapper,
         dummy,
         args.out,
-        input_names=["node_features", "edge_index", "edge_features"],
+        input_names=["node_features", "edge_index", "edge_features",
+                     "node_contour_ids", "contour_features"],
         output_names=["edge_probs"],
         dynamic_axes={
             "node_features": {0: "num_nodes"},
             "edge_index": {1: "num_edges"},
             "edge_features": {0: "num_edges"},
+            "node_contour_ids": {0: "num_nodes"},
+            "contour_features": {0: "num_contours"},
             "edge_probs": {0: "num_edges"},
         },
         opset_version=args.opset,
@@ -85,9 +98,11 @@ def main() -> None:
     # export() restores the module's original training mode afterwards, so
     # force eval again before comparing (dropout must stay disabled).
     wrapper.eval()
-    x, ei, ea = make_dummy_inputs(node_dim, edge_dim, n=37, e=143)
+    # Different node, edge and contour counts, to exercise all three axes.
+    x, ei, ea, ci, ca = make_dummy_inputs(node_dim, edge_dim, contour_dim,
+                                          n=37, e=143, c=11)
     with torch.no_grad():
-        expected = wrapper(x, ei, ea).numpy()
+        expected = wrapper(x, ei, ea, ci, ca).numpy()
     sess = rt.InferenceSession(args.out, providers=["CPUExecutionProvider"])
     got = sess.run(
         ["edge_probs"],
@@ -95,6 +110,8 @@ def main() -> None:
             "node_features": x.numpy(),
             "edge_index": ei.numpy(),
             "edge_features": ea.numpy(),
+            "node_contour_ids": ci.numpy(),
+            "contour_features": ca.numpy(),
         },
     )[0]
     err = float(np.abs(expected - got).max())

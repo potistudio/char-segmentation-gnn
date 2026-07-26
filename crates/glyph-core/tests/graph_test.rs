@@ -1,4 +1,4 @@
-use glyph_core::{Contour, ContourInstance, GraphConfig, NODE_DIM, build_graph};
+use glyph_core::{CONTOUR_DIM, Contour, ContourInstance, GraphConfig, NODE_DIM, build_graph};
 
 fn square(cx: f32, cy: f32, half: f32) -> Contour {
     Contour {
@@ -48,6 +48,45 @@ fn builds_labeled_graph_from_two_characters() {
     fwd.sort_unstable();
     rev.sort_unstable();
     assert_eq!(fwd, rev);
+}
+
+#[test]
+fn contour_features_are_one_row_per_contour() {
+    let upem = 1000.0;
+    let mut hole = square(0.0, 0.0, 150.0);
+    // Reversed winding: a counter, like the inside of 'o'.
+    hole.points.reverse();
+    let contours = vec![
+        ContourInstance {
+            contour: square(0.0, 0.0, 300.0),
+            char_id: 0,
+        },
+        ContourInstance {
+            contour: hole,
+            char_id: 0,
+        },
+    ];
+    let g = build_graph(&contours, upem, &GraphConfig::default());
+
+    assert_eq!(g.num_contours, 2);
+    assert_eq!(g.contour_dim as usize, CONTOUR_DIM);
+    assert_eq!(
+        g.contour_features.len(),
+        g.num_contours as usize * CONTOUR_DIM
+    );
+    // Every node's contour id must index a row that exists.
+    assert!(g.node_contour_ids.iter().all(|&c| c < g.num_contours));
+
+    // The signed area column carries the winding, so an outer contour and its
+    // counter come out with opposite signs.
+    let outer = g.contour_features[CONTOUR_DIM - 1];
+    let inner = g.contour_features[2 * CONTOUR_DIM - 1];
+    assert!(
+        outer * inner < 0.0,
+        "counter must wind against its outer contour, got {outer} and {inner}"
+    );
+    // Widths are in em: a 600-unit square at upem 1000 is 0.6 em across.
+    assert!((g.contour_features[2] - 0.6).abs() < 1e-5);
 }
 
 #[test]

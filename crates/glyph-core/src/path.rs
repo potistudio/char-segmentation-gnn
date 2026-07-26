@@ -24,6 +24,24 @@ impl Contour {
         len
     }
 
+    /// Twice the signed area (shoelace). The sign is the winding direction,
+    /// which separates an outer contour from a counter -- the hole in 'o' or
+    /// the loop in 'あ' -- and a counter always belongs to the character that
+    /// encloses it.
+    pub fn signed_area(&self) -> f32 {
+        let n = self.points.len();
+        if n < 3 {
+            return 0.0;
+        }
+        let mut sum = 0.0;
+        for i in 0..n {
+            let a = self.points[i];
+            let b = self.points[(i + 1) % n];
+            sum += a[0] * b[1] - b[0] * a[1];
+        }
+        sum * 0.5
+    }
+
     pub fn centroid(&self) -> [f32; 2] {
         let n = self.points.len().max(1) as f32;
         let mut c = [0.0f32; 2];

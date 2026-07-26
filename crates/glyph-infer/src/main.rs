@@ -143,15 +143,21 @@ impl Engine {
         let e = g.num_edges();
         let node_dim = g.node_dim as usize;
         let edge_dim = g.edge_dim as usize;
+        let c = g.num_contours as usize;
+        let contour_dim = g.contour_dim as usize;
 
-        // i64 edge index as required by the ONNX graph (torch.long).
+        // i64 indices as required by the ONNX graph (torch.long).
         let edge_index: Vec<i64> = g.edge_index.iter().map(|&v| v as i64).collect();
+        let contour_ids: Vec<i64> = g.node_contour_ids.iter().map(|&v| v as i64).collect();
 
         let nodes =
             Tensor::from_array(([n, node_dim], g.node_features.clone())).map_err(ort_err)?;
         let edges = Tensor::from_array(([2usize, e], edge_index)).map_err(ort_err)?;
         let eattr =
             Tensor::from_array(([e, edge_dim], g.edge_features.clone())).map_err(ort_err)?;
+        let cids = Tensor::from_array(([n], contour_ids)).map_err(ort_err)?;
+        let cattr =
+            Tensor::from_array(([c, contour_dim], g.contour_features.clone())).map_err(ort_err)?;
 
         let outputs = self
             .session
@@ -159,6 +165,8 @@ impl Engine {
                 "node_features" => nodes,
                 "edge_index" => edges,
                 "edge_features" => eattr,
+                "node_contour_ids" => cids,
+                "contour_features" => cattr,
             ])
             .map_err(ort_err)?;
         let (_, probs) = outputs["edge_probs"]

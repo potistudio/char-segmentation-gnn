@@ -9,7 +9,8 @@ pub mod path;
 pub mod sample;
 
 pub use graph::{
-    ContourInstance, EDGE_DIM, GraphConfig, GraphSample, NODE_DIM, UNKNOWN_CHAR, build_graph,
+    CONTOUR_DIM, ContourInstance, EDGE_DIM, GraphConfig, GraphSample, NODE_DIM, UNKNOWN_CHAR,
+    build_graph,
 };
 pub use layout::{LayoutConfig, LayoutError, layout_text};
 pub use path::{Contour, ContourBuilder};

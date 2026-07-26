@@ -115,20 +115,23 @@ def check_single_graph_matches_batched(graphs: list) -> None:
     how it was trained -- silently, since nothing else would notice.
     """
     graph = graphs[0]
-    model = GlyphEdgeGNN(node_dim=int(graph.x.shape[1]), hidden=32, layers=2, dropout=0.0)
+    model = GlyphEdgeGNN(node_dim=int(graph.x.shape[1]),
+                         contour_dim=int(graph.contour_attr.shape[1]),
+                         hidden=32, layers=2, dropout=0.0)
     model.eval()
+    args = (graph.x, graph.edge_index, graph.edge_attr, graph.contour_id, graph.contour_attr)
     with torch.no_grad():
-        exported = model(graph.x, graph.edge_index, graph.edge_attr)
-        trained = model(graph.x, graph.edge_index, graph.edge_attr,
-                        torch.zeros(graph.num_nodes, dtype=torch.long))
+        exported = model(*args)
+        trained = model(*args, torch.zeros(graph.num_nodes, dtype=torch.long))
     gap = float((exported - trained).abs().max())
     assert gap < 1e-5, f"single-graph and batched pooling disagree by {gap:.3e}"
 
     # And a two-graph batch must not leak the pool across the boundary.
     pair = Batch.from_data_list([graphs[0], graphs[1]])
     with torch.no_grad():
-        together = model(pair.x, pair.edge_index, pair.edge_attr, pair.batch)
-        alone = model(graphs[0].x, graphs[0].edge_index, graphs[0].edge_attr)
+        together = model(pair.x, pair.edge_index, pair.edge_attr,
+                         pair.contour_id, pair.contour_attr, pair.batch)
+        alone = model(*args)
     leak = float((together[:graphs[0].y.numel()] - alone).abs().max())
     assert leak < 1e-5, f"batching changed a graph's logits by {leak:.3e} (pool leaked)"
     print(f"pooling isolation ok | export vs train {gap:.2e}, batch leak {leak:.2e}")

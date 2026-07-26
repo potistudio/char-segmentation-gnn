@@ -60,6 +60,70 @@ class EdgeGATLayer(nn.Module):
         return self.norm(x + self.out(agg.reshape(n, h * hd)))
 
 
+def scatter_mean(values: torch.Tensor, index: torch.Tensor, size: int) -> torch.Tensor:
+    """Per-bin mean over rows, as gather/scatter_add so it exports to ONNX."""
+    spread = index.unsqueeze(-1).expand(-1, values.shape[-1])
+    total = values.new_zeros(size, values.shape[-1]).scatter_add_(0, spread, values)
+    counts = values.new_zeros(size).scatter_add_(
+        0, index, torch.ones_like(index, dtype=values.dtype)
+    )
+    return total / counts.clamp(min=1).unsqueeze(-1)
+
+
+class ContourLayer(nn.Module):
+    """Pools points into contour supernodes, attends across them, scatters back.
+
+    Point-level message passing covers about 0.5 em in four hops, less than one
+    character cell, so an edge never sees the glyph next door. A contour is a
+    whole stroke and a line holds only 10-18 of them, so attention at that
+    level spans the entire line for a few percent of the cost: 18^2 pairs
+    against 6,000 point edges.
+
+    Attention is dense rather than an edge list. Inference runs one line at a
+    time, so the traced graph is a plain [C, C] product and the export needs no
+    adjacency input; ``mask`` only exists to keep a training batch from
+    attending across graph boundaries.
+    """
+
+    def __init__(self, dim: int, contour_dim: int, heads: int = 4, dropout: float = 0.0):
+        super().__init__()
+        assert dim % heads == 0
+        self.heads = heads
+        self.head_dim = dim // heads
+        # The supernode starts from its own geometry (centroid, bbox, arc
+        # length, signed area) plus the mean of the points it owns.
+        self.embed = nn.Linear(contour_dim, dim)
+        self.query = nn.Linear(dim, dim)
+        self.key = nn.Linear(dim, dim)
+        self.value = nn.Linear(dim, dim)
+        self.proj = nn.Linear(dim, dim)
+        self.norm_contour = nn.LayerNorm(dim)
+        self.out = nn.Linear(dim, dim)
+        self.norm = nn.LayerNorm(dim)
+        self.dropout = dropout
+
+    def forward(self, hx: torch.Tensor, contour_id: torch.Tensor,
+                contour_attr: torch.Tensor, mask: torch.Tensor | None) -> torch.Tensor:
+        contours = contour_attr.shape[0]
+        h, hd = self.heads, self.head_dim
+        z = self.norm_contour(
+            scatter_mean(hx, contour_id, contours) + self.embed(contour_attr)
+        )
+
+        def heads_of(linear: nn.Module) -> torch.Tensor:
+            return linear(z).view(contours, h, hd).transpose(0, 1)  # [H, C, D]
+
+        scores = heads_of(self.query) @ heads_of(self.key).transpose(-2, -1)
+        scores = scores * (self.head_dim ** -0.5)
+        if mask is not None:
+            scores = scores + mask
+        weights = F.dropout(scores.softmax(dim=-1), p=self.dropout, training=self.training)
+        mixed = (weights @ heads_of(self.value)).transpose(0, 1).reshape(contours, h * hd)
+
+        z = z + self.proj(mixed)
+        return self.norm(hx + self.out(z)[contour_id])
+
+
 class GlyphEdgeGNN(nn.Module):
     """Node encoder -> stacked edge-aware GAT layers -> edge classifier.
 
@@ -81,11 +145,14 @@ class GlyphEdgeGNN(nn.Module):
         heads: int = 4,
         dropout: float = 0.1,
         context: bool = True,
+        contour_dim: int = 8,
+        contours: bool = True,
     ):
         super().__init__()
         self.hparams = dict(
             node_dim=node_dim, edge_dim=edge_dim, hidden=hidden,
             layers=layers, heads=heads, dropout=dropout, context=context,
+            contour_dim=contour_dim, contours=contours,
         )
         # Initial layer aligning heterogeneous node feature dimensions.
         self.encoder = nn.Sequential(
@@ -97,6 +164,12 @@ class GlyphEdgeGNN(nn.Module):
         self.convs = nn.ModuleList(
             EdgeGATLayer(hidden, edge_dim, heads, dropout) for _ in range(layers)
         )
+        # One contour round after each point round, so global structure is
+        # available while the point representations are still forming rather
+        # than bolted on at the end.
+        self.contour_layers = nn.ModuleList(
+            ContourLayer(hidden, contour_dim, heads, dropout) for _ in range(layers)
+        ) if contours else None
         # Mean and max carry different things: the mean is the average look of
         # the line, the max reports whether a feature occurs anywhere in it.
         self.context = nn.Sequential(
@@ -133,12 +206,34 @@ class GlyphEdgeGNN(nn.Module):
         )
         return torch.cat([total / counts.clamp(min=1).unsqueeze(-1), peak], dim=-1)
 
+    @staticmethod
+    def contour_mask(contour_id: torch.Tensor, contour_attr: torch.Tensor,
+                     batch: torch.Tensor | None) -> torch.Tensor | None:
+        """Additive attention mask blocking contours of different graphs.
+
+        ``None`` for a single graph, which is both the ONNX path and the reason
+        the export needs no adjacency: with one graph every contour may attend
+        to every other, so the mask is the identity operation and drops out.
+        """
+        if batch is None:
+            return None
+        owner = contour_id.new_zeros(contour_attr.shape[0]).scatter_(0, contour_id, batch)
+        same = owner.unsqueeze(-1) == owner.unsqueeze(0)
+        return torch.zeros_like(same, dtype=contour_attr.dtype).masked_fill(
+            ~same, float("-inf")
+        )
+
     def forward(self, x: torch.Tensor, edge_index: torch.Tensor, edge_attr: torch.Tensor,
+                contour_id: torch.Tensor, contour_attr: torch.Tensor,
                 batch: torch.Tensor | None = None) -> torch.Tensor:
         """Returns raw edge logits, shape [num_edges]."""
         hx = self.encoder(x)
-        for conv in self.convs:
+        mask = (self.contour_mask(contour_id, contour_attr, batch)
+                if self.contour_layers is not None else None)
+        for depth, conv in enumerate(self.convs):
             hx = conv(hx, edge_index, edge_attr)
+            if self.contour_layers is not None:
+                hx = self.contour_layers[depth](hx, contour_id, contour_attr, mask)
         src, dst = edge_index[0], edge_index[1]
         hs, hd = hx[src], hx[dst]
         parts = [hs, hd, (hs - hd).abs(), edge_attr]
@@ -150,14 +245,25 @@ class GlyphEdgeGNN(nn.Module):
 
 
 MODEL_HPARAM_KEYS = frozenset(
-    {"node_dim", "edge_dim", "hidden", "layers", "heads", "dropout", "context"}
+    {"node_dim", "edge_dim", "hidden", "layers", "heads", "dropout", "context",
+     "contour_dim", "contours"}
 )
 GRAPH_HPARAM_KEYS = frozenset({"knn", "radius", "contour_bridge"})
 
 
+#: Components added after checkpoints already existed. A checkpoint from before
+#: one of them simply has no key for it, and that absence has to read as "off"
+#: rather than as the current default -- otherwise loading it fails on weights
+#: the run never had.
+ADDED_LATER = {"context": False, "contours": False}
+
+
 def model_hparams(hparams: dict) -> dict:
     """Return only keys accepted by :class:`GlyphEdgeGNN`."""
-    return {k: hparams[k] for k in MODEL_HPARAM_KEYS if k in hparams}
+    kwargs = {k: hparams[k] for k in MODEL_HPARAM_KEYS if k in hparams}
+    for key, absent in ADDED_LATER.items():
+        kwargs.setdefault(key, absent)
+    return kwargs
 
 
 def graph_hparams(hparams: dict) -> dict:

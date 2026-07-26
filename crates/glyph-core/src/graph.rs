@@ -22,6 +22,12 @@ use crate::sample::{SampleConfig, resample_contour};
 pub const NODE_DIM: usize = 13;
 /// Feature vector width per edge.
 pub const EDGE_DIM: usize = 4;
+/// Feature vector width per contour supernode.
+///
+/// One row per contour rather than per sampled point. Four hops of point-level
+/// message passing only reach ~0.5 em, so the model needs a level where a
+/// whole stroke is a single token and the line is a handful of them.
+pub const CONTOUR_DIM: usize = 8;
 
 /// Char id used at inference time when the ground truth is unknown.
 pub const UNKNOWN_CHAR: u32 = u32::MAX;
@@ -75,6 +81,10 @@ pub struct GraphSample {
     pub edge_dim: u32,
     /// Row-major `[num_edges * edge_dim]`.
     pub edge_features: Vec<f32>,
+    pub num_contours: u32,
+    pub contour_dim: u32,
+    /// Row-major `[num_contours * contour_dim]`, indexed by contour id.
+    pub contour_features: Vec<f32>,
     /// `[num_edges]`: 1 if both endpoints belong to the same character.
     pub edge_labels: Vec<u8>,
     /// `[num_nodes]`: ground-truth character id per node (debug/eval).
@@ -115,8 +125,10 @@ pub fn build_graph(contours: &[ContourInstance], upem: f32, cfg: &GraphConfig) -
     struct Pending {
         samples: Vec<crate::sample::SampledPoint>,
         centroid: [f32; 2],
+        bbox_min: [f32; 2],
         bbox_wh: [f32; 2],
         arc_len: f32,
+        signed_area: f32,
         char_id: u32,
     }
     let mut pending: Vec<Pending> = Vec::new();
@@ -131,8 +143,10 @@ pub fn build_graph(contours: &[ContourInstance], upem: f32, cfg: &GraphConfig) -
         pending.push(Pending {
             samples,
             centroid: [c[0], c[1]],
+            bbox_min: [bmin[0], bmin[1]],
             bbox_wh: [bmax[0] - bmin[0], bmax[1] - bmin[1]],
             arc_len: inst.contour.arc_length(),
+            signed_area: inst.contour.signed_area(),
             char_id: inst.char_id,
         });
     }
@@ -254,6 +268,22 @@ pub fn build_graph(contours: &[ContourInstance], upem: f32, cfg: &GraphConfig) -
     let mut edge_index = src;
     edge_index.extend_from_slice(&dst);
 
+    // One row per contour, in contour-id order. Areas are scaled by the square
+    // of the linear scale so they stay in em^2.
+    let mut contour_features = Vec::with_capacity(pending.len() * CONTOUR_DIM);
+    for p in &pending {
+        contour_features.extend_from_slice(&[
+            (p.centroid[0] - min_x) * scale,
+            p.centroid[1] * scale,
+            p.bbox_wh[0] * scale,
+            p.bbox_wh[1] * scale,
+            (p.bbox_min[0] - min_x) * scale,
+            p.bbox_min[1] * scale,
+            p.arc_len * scale,
+            p.signed_area * scale * scale,
+        ]);
+    }
+
     let mut node_features = Vec::with_capacity(nodes.len() * NODE_DIM);
     let mut node_char_ids = Vec::with_capacity(nodes.len());
     let mut node_contour_ids = Vec::with_capacity(nodes.len());
@@ -270,6 +300,9 @@ pub fn build_graph(contours: &[ContourInstance], upem: f32, cfg: &GraphConfig) -
         edge_index,
         edge_dim: EDGE_DIM as u32,
         edge_features,
+        num_contours: pending.len() as u32,
+        contour_dim: CONTOUR_DIM as u32,
+        contour_features,
         edge_labels,
         node_char_ids,
         node_contour_ids,
