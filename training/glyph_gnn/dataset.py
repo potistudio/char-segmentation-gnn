@@ -133,6 +133,18 @@ def load_dataset(
     return train, val
 
 
+def dataset_node_dim(graphs) -> int:
+    """Feature width the store actually carries.
+
+    Read from the data rather than trusting the model default, so a store built
+    before a feature was added fails on a shape mismatch at construction time
+    instead of training against silently misaligned columns.
+    """
+    if hasattr(graphs, "node_dim"):
+        return int(graphs.node_dim)
+    return int(graphs[0].x.shape[1])
+
+
 def graph_stats(graphs) -> dict:
     """Summarizes a dataset without materializing it when it is packed."""
     if hasattr(graphs, "stats"):

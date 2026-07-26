@@ -18,7 +18,13 @@ from pathlib import Path
 import torch
 from tqdm.auto import tqdm
 
-from .dataset import graph_stats, load_dataset, load_packed, make_loader
+from .dataset import (
+    dataset_node_dim,
+    graph_stats,
+    load_dataset,
+    load_packed,
+    make_loader,
+)
 from .loss import glyph_loss
 from .metrics import DEFAULT_THRESHOLDS, GroupingEvaluator, format_sweep
 from .model import GlyphEdgeGNN
@@ -66,7 +72,9 @@ def print_run_summary(args, model, train_stats, val_stats, steps_per_epoch,
 
     model_row = (
         f"hidden {args.hidden} | layers {args.layers} | heads {args.heads}"
-        f" | dropout {args.dropout} | {params:,} params"
+        f" | dropout {args.dropout}"
+        f" | global context {'off' if args.no_global_context else 'on'}"
+        f" | {params:,} params"
     )
     optim_row = (
         f"AdamW lr {args.lr:.2e} | weight decay {args.weight_decay:.2e}"
@@ -131,7 +139,7 @@ def evaluate(model, loader, device, settings: dict,
     for batch in bar:
         batch = batch.to(device)
         try:
-            logits = model(batch.x, batch.edge_index, batch.edge_attr)
+            logits = model(batch.x, batch.edge_index, batch.edge_attr, batch.batch)
             loss, _ = glyph_loss(logits, batch.y, batch.contour_id, batch.edge_index,
                                  **settings)
         except torch.OutOfMemoryError:
@@ -173,6 +181,9 @@ def main() -> None:
     ap.add_argument("--layers", type=int, default=4)
     ap.add_argument("--heads", type=int, default=4)
     ap.add_argument("--dropout", type=float, default=0.1)
+    ap.add_argument("--no-global-context", action="store_true",
+                    help="drop the graph-level summary from the edge classifier;"
+                         " an ablation, since four hops only reach ~0.5 em")
     ap.add_argument("--focal-alpha", type=float, default=0.25,
                     help="positive-class weight for the point-edge term")
     ap.add_argument("--focal-gamma", type=float, default=2.0)
@@ -253,7 +264,8 @@ def main() -> None:
                              num_workers=workers)
 
     model = GlyphEdgeGNN(
-        hidden=args.hidden, layers=args.layers, heads=args.heads, dropout=args.dropout
+        node_dim=dataset_node_dim(train_set), hidden=args.hidden, layers=args.layers,
+        heads=args.heads, dropout=args.dropout, context=not args.no_global_context
     ).to(device)
     model.hparams.update(
         knn=args.knn,
@@ -289,7 +301,7 @@ def main() -> None:
             batch = batch.to(device)
             optim.zero_grad(set_to_none=True)
             try:
-                logits = model(batch.x, batch.edge_index, batch.edge_attr)
+                logits = model(batch.x, batch.edge_index, batch.edge_attr, batch.batch)
                 loss, terms = glyph_loss(logits, batch.y, batch.contour_id,
                                          batch.edge_index, **settings)
                 loss.backward()

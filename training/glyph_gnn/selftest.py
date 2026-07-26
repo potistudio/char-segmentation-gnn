@@ -26,11 +26,13 @@ from pathlib import Path
 
 import numpy as np
 import torch
+from torch_geometric.data import Batch
 from torch_geometric.loader import DataLoader
 
 from .dataset import load_shard
 from .loss import focal_loss, glyph_loss, soft_max_pool
 from .metrics import DEFAULT_THRESHOLDS, GroupingEvaluator, contour_pair_index
+from .model import GlyphEdgeGNN
 from .postprocess import group_characters
 
 
@@ -101,6 +103,35 @@ def check_agrees_with_postprocess(graphs: list, seed: int) -> None:
                 )
         print(f"  threshold {threshold:.2f}: {want.sum():>4}/{want.size} graphs correct,"
               " batched == postprocess")
+
+
+def check_single_graph_matches_batched(graphs: list) -> None:
+    """The path ONNX traces must equal the path training takes.
+
+    ``pool`` has two branches: ``batch=None`` reduces over every node, which is
+    what the export traces because inference runs one line at a time, and the
+    scattered branch, which is what training runs. A single graph has to give
+    the same answer through both, or the model ships behaving differently from
+    how it was trained -- silently, since nothing else would notice.
+    """
+    graph = graphs[0]
+    model = GlyphEdgeGNN(node_dim=int(graph.x.shape[1]), hidden=32, layers=2, dropout=0.0)
+    model.eval()
+    with torch.no_grad():
+        exported = model(graph.x, graph.edge_index, graph.edge_attr)
+        trained = model(graph.x, graph.edge_index, graph.edge_attr,
+                        torch.zeros(graph.num_nodes, dtype=torch.long))
+    gap = float((exported - trained).abs().max())
+    assert gap < 1e-5, f"single-graph and batched pooling disagree by {gap:.3e}"
+
+    # And a two-graph batch must not leak the pool across the boundary.
+    pair = Batch.from_data_list([graphs[0], graphs[1]])
+    with torch.no_grad():
+        together = model(pair.x, pair.edge_index, pair.edge_attr, pair.batch)
+        alone = model(graphs[0].x, graphs[0].edge_index, graphs[0].edge_attr)
+    leak = float((together[:graphs[0].y.numel()] - alone).abs().max())
+    assert leak < 1e-5, f"batching changed a graph's logits by {leak:.3e} (pool leaked)"
+    print(f"pooling isolation ok | export vs train {gap:.2e}, batch leak {leak:.2e}")
 
 
 def check_pooling() -> None:
@@ -197,6 +228,7 @@ def main() -> None:
     print(f"{len(graphs)} graphs from {shards[0].name}\n")
 
     check_known_answers(graphs)
+    check_single_graph_matches_batched(graphs)
     check_pooling()
     check_point_only_matches_focal(graphs)
     check_pair_loss_punishes_one_spike(graphs)

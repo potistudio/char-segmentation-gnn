@@ -11,6 +11,14 @@ use crate::path::Contour;
 use crate::sample::{SampleConfig, resample_contour};
 
 /// Feature vector width per node. Kept as a constant so Rust and Python agree.
+///
+/// A Fourier encoding of x (sin/cos at 0.5/1/2 em, and again at 1/2/4 em) was
+/// tried here to hand the model a basis for character pitch, and measured
+/// worse both times: grouping accuracy 0.7875 -> 0.7500 / 0.7583 on ja-6k,
+/// reproduced on a second seed. Sample points sit 0.05 em apart, so even the
+/// long set turns over fast enough to read as noise to the encoder that feeds
+/// every attention layer. The graph-level pooling in the classifier supplies
+/// the same global signal without touching the node features.
 pub const NODE_DIM: usize = 13;
 /// Feature vector width per edge.
 pub const EDGE_DIM: usize = 4;
