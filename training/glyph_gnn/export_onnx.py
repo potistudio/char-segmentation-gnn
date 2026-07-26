@@ -39,7 +39,10 @@ def make_dummy_inputs(node_dim: int, edge_dim: int, contour_dim: int,
     # Every contour must own at least one node, or its supernode row is a
     # mean over nothing; the real builder guarantees that.
     contour_id = torch.cat([torch.arange(c), torch.randint(0, c, (n - c,))]).long()
-    contour_attr = torch.randn(c, contour_dim)
+    # Contour features must stay in their real domain, not just their shape:
+    # widths, heights and arc lengths are non-negative, and the model takes a
+    # log of the arc length ratio, so plain randn would trace a NaN.
+    contour_attr = torch.rand(c, contour_dim)
     return x, edge_index, edge_attr, contour_id, contour_attr
 
 
