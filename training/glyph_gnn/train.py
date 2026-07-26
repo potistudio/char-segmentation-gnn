@@ -76,6 +76,7 @@ def print_run_summary(args, model, train_stats, val_stats, steps_per_epoch,
         f" | dropout {args.dropout}"
         f" | global context {'off' if args.no_global_context else 'on'}"
         f" | contour layers {'off' if args.no_contour_layers else 'on'}"
+        f" | relations {'off' if args.no_contour_relations else 'on'}"
         f" | {params:,} params"
     )
     optim_row = (
@@ -184,6 +185,10 @@ def main() -> None:
     ap.add_argument("--layers", type=int, default=4)
     ap.add_argument("--heads", type=int, default=4)
     ap.add_argument("--dropout", type=float, default=0.1)
+    ap.add_argument("--no-contour-relations", action="store_true",
+                    help="drop the derived contour-pair geometry (bbox overlap, gap,"
+                         " containment, winding) from the attention bias and the"
+                         " classifier; an ablation")
     ap.add_argument("--no-contour-layers", action="store_true",
                     help="drop the contour supernode rounds; an ablation, since they"
                          " are what carries information past ~0.5 em")
@@ -273,6 +278,7 @@ def main() -> None:
         node_dim=dataset_node_dim(train_set), contour_dim=dataset_contour_dim(train_set),
         hidden=args.hidden, layers=args.layers, heads=args.heads, dropout=args.dropout,
         context=not args.no_global_context, contours=not args.no_contour_layers,
+        relations=not args.no_contour_relations,
     ).to(device)
     model.hparams.update(
         knn=args.knn,

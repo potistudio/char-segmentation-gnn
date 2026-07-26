@@ -32,7 +32,15 @@ from torch_geometric.loader import DataLoader
 from .dataset import load_shard
 from .loss import focal_loss, glyph_loss, soft_max_pool
 from .metrics import DEFAULT_THRESHOLDS, GroupingEvaluator, contour_pair_index
-from .model import GlyphEdgeGNN
+from .model import (
+    C_AREA,
+    C_H,
+    C_MINX,
+    C_MINY,
+    C_W,
+    GlyphEdgeGNN,
+    contour_relations,
+)
 from .postprocess import group_characters
 
 
@@ -137,6 +145,45 @@ def check_single_graph_matches_batched(graphs: list) -> None:
     print(f"pooling isolation ok | export vs train {gap:.2e}, batch leak {leak:.2e}")
 
 
+def check_contour_layout(graphs: list) -> None:
+    """``contour_attr`` columns must line up with the geometry of the nodes.
+
+    The layout is declared twice -- ``graph.rs`` writes it and ``model.py``
+    reads it to derive the relational features -- so a reordering on either
+    side has to fail here rather than quietly feed the attention bias numbers
+    that mean something else.
+    """
+    # A pair with itself: fully overlapping, no offset, same winding.
+    row = graphs[0].contour_attr[:1]
+    self_rel = contour_relations(row, row)[0]
+    assert torch.allclose(self_rel[:3], torch.zeros(3), atol=1e-6), "self offset must vanish"
+    assert abs(float(self_rel[3]) - float(row[0, C_W])) < 1e-5, "self x-overlap is the width"
+    assert abs(float(self_rel[4]) - float(row[0, C_H])) < 1e-5, "self y-overlap is the height"
+    assert abs(float(self_rel[7])) < 1e-6 and abs(float(self_rel[8])) < 1e-6
+    assert abs(float(self_rel[9])) < 1e-5, "self size ratio must be log 1"
+    assert float(self_rel[10]) > 0, "a contour must agree with its own winding"
+
+    checked = 0
+    for graph in graphs[:25]:
+        xs, ys = graph.x[:, 0], graph.x[:, 1]
+        for contour in range(int(graph.contour_attr.shape[0])):
+            owned = graph.contour_id == contour
+            if not bool(owned.any()):
+                continue
+            box = graph.contour_attr[contour]
+            # Resampled points land inside the true outline box, and no more
+            # than one sample spacing (0.05 em) short of its edges.
+            assert float(box[C_MINX]) <= float(xs[owned].min()) + 0.06
+            assert float(box[C_MINY]) <= float(ys[owned].min()) + 0.06
+            assert float(box[C_MINX] + box[C_W]) >= float(xs[owned].max()) - 0.06
+            assert float(box[C_MINY] + box[C_H]) >= float(ys[owned].max()) - 0.06
+            # A polygon cannot enclose more than its own bounding box.
+            assert abs(float(box[C_AREA])) <= float(box[C_W] * box[C_H]) + 1e-6
+            checked += 1
+
+    print(f"contour layout ok | {checked:,} contour boxes agree with their nodes")
+
+
 def check_pooling() -> None:
     """The pair pooling must approach the max that inference actually takes."""
     logits = torch.tensor([-3.0, -2.5, 4.0, -2.0, -3.5, 0.5])
@@ -231,6 +278,7 @@ def main() -> None:
     print(f"{len(graphs)} graphs from {shards[0].name}\n")
 
     check_known_answers(graphs)
+    check_contour_layout(graphs)
     check_single_graph_matches_batched(graphs)
     check_pooling()
     check_point_only_matches_focal(graphs)

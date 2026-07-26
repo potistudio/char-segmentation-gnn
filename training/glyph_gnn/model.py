@@ -60,6 +60,71 @@ class EdgeGATLayer(nn.Module):
         return self.norm(x + self.out(agg.reshape(n, h * hd)))
 
 
+# Columns of a contour_attr row, matching crates/glyph-core/src/graph.rs.
+# glyph_gnn.selftest checks these against the geometry of a real shard, so a
+# reordering on the Rust side fails loudly instead of feeding the model
+# plausible nonsense.
+C_CX, C_CY, C_W, C_H, C_MINX, C_MINY, C_ARC, C_AREA = range(8)
+#: Width of :func:`contour_relations`.
+CONTOUR_RELATIONS = 11
+
+
+def contour_relations(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    """Geometry between two contours, from their feature rows.
+
+    Broadcasts over leading dimensions, so the same function serves the
+    all-pairs bias inside the contour attention and the single pair behind one
+    edge in the classifier.
+
+    These are derived rather than stored. As edge columns they would cost about
+    13 GiB on ja-train's 700M edges -- ``dist`` alone was 2.62 GiB -- and every
+    one of them is a function of two contour rows that are already in memory.
+
+    What they carry is the distinction the point-level features cannot express.
+    Two 'l' stems sit side by side: their boxes do not overlap in x and the gap
+    is a fraction of an em. The two strokes of "二" overlap in x completely and
+    are stacked in y. A counter winds against the contour that encloses it and
+    sits strictly inside its box.
+    """
+    eps = 1e-6
+    ax0, ay0 = a[..., C_MINX], a[..., C_MINY]
+    ax1, ay1 = ax0 + a[..., C_W], ay0 + a[..., C_H]
+    bx0, by0 = b[..., C_MINX], b[..., C_MINY]
+    bx1, by1 = bx0 + b[..., C_W], by0 + b[..., C_H]
+
+    # Signed: positive is an overlap, negative is a gap, both in em so they are
+    # directly comparable to character pitch.
+    over_x = torch.minimum(ax1, bx1) - torch.maximum(ax0, bx0)
+    over_y = torch.minimum(ay1, by1) - torch.maximum(ay0, by0)
+    span_x = torch.minimum(a[..., C_W], b[..., C_W]).clamp(min=eps)
+    span_y = torch.minimum(a[..., C_H], b[..., C_H]).clamp(min=eps)
+
+    dx = b[..., C_CX] - a[..., C_CX]
+    dy = b[..., C_CY] - a[..., C_CY]
+
+    # How deeply one box sits inside the other; positive means enclosed.
+    a_in_b = torch.minimum(torch.minimum(ax0 - bx0, ay0 - by0),
+                           torch.minimum(bx1 - ax1, by1 - ay1))
+    b_in_a = torch.minimum(torch.minimum(bx0 - ax0, by0 - ay0),
+                           torch.minimum(ax1 - bx1, ay1 - by1))
+
+    area_a, area_b = a[..., C_AREA], b[..., C_AREA]
+    return torch.stack([
+        dx,
+        dy,
+        torch.sqrt(dx * dx + dy * dy),
+        over_x,
+        over_y,
+        (over_x / span_x).clamp(-4.0, 1.0),
+        (over_y / span_y).clamp(-4.0, 1.0),
+        a_in_b,
+        b_in_a,
+        torch.log((a[..., C_ARC] + eps) / (b[..., C_ARC] + eps)),
+        # Opposite winding is the signature of an outer contour and its hole.
+        torch.sign(area_a) * torch.sign(area_b),
+    ], dim=-1)
+
+
 def scatter_mean(values: torch.Tensor, index: torch.Tensor, size: int) -> torch.Tensor:
     """Per-bin mean over rows, as gather/scatter_add so it exports to ONNX."""
     spread = index.unsqueeze(-1).expand(-1, values.shape[-1])
@@ -85,7 +150,8 @@ class ContourLayer(nn.Module):
     attending across graph boundaries.
     """
 
-    def __init__(self, dim: int, contour_dim: int, heads: int = 4, dropout: float = 0.0):
+    def __init__(self, dim: int, contour_dim: int, heads: int = 4, dropout: float = 0.0,
+                 relations: bool = True):
         super().__init__()
         assert dim % heads == 0
         self.heads = heads
@@ -93,6 +159,10 @@ class ContourLayer(nn.Module):
         # The supernode starts from its own geometry (centroid, bbox, arc
         # length, signed area) plus the mean of the points it owns.
         self.embed = nn.Linear(contour_dim, dim)
+        # Relative geometry enters as a per-head attention bias rather than as
+        # more channels: whether two strokes overlap in x is a property of the
+        # pair, and the pair is exactly what a score indexes.
+        self.rel_bias = nn.Linear(CONTOUR_RELATIONS, heads) if relations else None
         self.query = nn.Linear(dim, dim)
         self.key = nn.Linear(dim, dim)
         self.value = nn.Linear(dim, dim)
@@ -103,7 +173,8 @@ class ContourLayer(nn.Module):
         self.dropout = dropout
 
     def forward(self, hx: torch.Tensor, contour_id: torch.Tensor,
-                contour_attr: torch.Tensor, mask: torch.Tensor | None) -> torch.Tensor:
+                contour_attr: torch.Tensor, relations: torch.Tensor,
+                mask: torch.Tensor | None) -> torch.Tensor:
         contours = contour_attr.shape[0]
         h, hd = self.heads, self.head_dim
         z = self.norm_contour(
@@ -115,6 +186,8 @@ class ContourLayer(nn.Module):
 
         scores = heads_of(self.query) @ heads_of(self.key).transpose(-2, -1)
         scores = scores * (self.head_dim ** -0.5)
+        if self.rel_bias is not None:
+            scores = scores + self.rel_bias(relations).permute(2, 0, 1)
         if mask is not None:
             scores = scores + mask
         weights = F.dropout(scores.softmax(dim=-1), p=self.dropout, training=self.training)
@@ -147,12 +220,13 @@ class GlyphEdgeGNN(nn.Module):
         context: bool = True,
         contour_dim: int = 8,
         contours: bool = True,
+        relations: bool = True,
     ):
         super().__init__()
         self.hparams = dict(
             node_dim=node_dim, edge_dim=edge_dim, hidden=hidden,
             layers=layers, heads=heads, dropout=dropout, context=context,
-            contour_dim=contour_dim, contours=contours,
+            contour_dim=contour_dim, contours=contours, relations=relations,
         )
         # Initial layer aligning heterogeneous node feature dimensions.
         self.encoder = nn.Sequential(
@@ -167,8 +241,10 @@ class GlyphEdgeGNN(nn.Module):
         # One contour round after each point round, so global structure is
         # available while the point representations are still forming rather
         # than bolted on at the end.
+        self.use_relations = contours and relations
         self.contour_layers = nn.ModuleList(
-            ContourLayer(hidden, contour_dim, heads, dropout) for _ in range(layers)
+            ContourLayer(hidden, contour_dim, heads, dropout, self.use_relations)
+            for _ in range(layers)
         ) if contours else None
         # Mean and max carry different things: the mean is the average look of
         # the line, the max reports whether a feature occurs anywhere in it.
@@ -176,8 +252,13 @@ class GlyphEdgeGNN(nn.Module):
             nn.Linear(hidden * 2, hidden),
             nn.ReLU(),
         ) if context else None
+        # The classifier sees the geometry of its own contour pair too: after
+        # the contour rounds the states know about it, but the raw numbers are
+        # free to gather and the decision is made here.
+        classifier_in = (hidden * (4 if context else 3) + edge_dim
+                         + (CONTOUR_RELATIONS if self.use_relations else 0))
         self.classifier = nn.Sequential(
-            nn.Linear(hidden * (4 if context else 3) + edge_dim, hidden),
+            nn.Linear(classifier_in, hidden),
             nn.ReLU(),
             nn.Dropout(dropout),
             nn.Linear(hidden, hidden // 2),
@@ -228,15 +309,25 @@ class GlyphEdgeGNN(nn.Module):
                 batch: torch.Tensor | None = None) -> torch.Tensor:
         """Returns raw edge logits, shape [num_edges]."""
         hx = self.encoder(x)
-        mask = (self.contour_mask(contour_id, contour_attr, batch)
-                if self.contour_layers is not None else None)
+        relations = mask = None
+        if self.contour_layers is not None:
+            mask = self.contour_mask(contour_id, contour_attr, batch)
+        if self.use_relations:
+            # Geometry does not change between rounds, so build the all-pairs
+            # table once and let every layer read its own bias off it.
+            relations = contour_relations(contour_attr.unsqueeze(1),
+                                          contour_attr.unsqueeze(0))
         for depth, conv in enumerate(self.convs):
             hx = conv(hx, edge_index, edge_attr)
             if self.contour_layers is not None:
-                hx = self.contour_layers[depth](hx, contour_id, contour_attr, mask)
+                hx = self.contour_layers[depth](hx, contour_id, contour_attr,
+                                                relations, mask)
         src, dst = edge_index[0], edge_index[1]
         hs, hd = hx[src], hx[dst]
         parts = [hs, hd, (hs - hd).abs(), edge_attr]
+        if self.use_relations:
+            parts.append(contour_relations(contour_attr[contour_id[src]],
+                                           contour_attr[contour_id[dst]]))
         if self.context is not None:
             summary = self.context(self.pool(hx, batch))
             parts.append(summary[batch[src]] if batch is not None
@@ -246,7 +337,7 @@ class GlyphEdgeGNN(nn.Module):
 
 MODEL_HPARAM_KEYS = frozenset(
     {"node_dim", "edge_dim", "hidden", "layers", "heads", "dropout", "context",
-     "contour_dim", "contours"}
+     "contour_dim", "contours", "relations"}
 )
 GRAPH_HPARAM_KEYS = frozenset({"knn", "radius", "contour_bridge"})
 
@@ -255,7 +346,7 @@ GRAPH_HPARAM_KEYS = frozenset({"knn", "radius", "contour_bridge"})
 #: one of them simply has no key for it, and that absence has to read as "off"
 #: rather than as the current default -- otherwise loading it fails on weights
 #: the run never had.
-ADDED_LATER = {"context": False, "contours": False}
+ADDED_LATER = {"context": False, "contours": False, "relations": False}
 
 
 def model_hparams(hparams: dict) -> dict:
