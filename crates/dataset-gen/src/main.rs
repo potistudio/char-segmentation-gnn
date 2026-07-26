@@ -98,27 +98,28 @@ struct Args {
     #[arg(long, default_value_t = 64)]
     max_points: usize,
 
-    /// Tightest tracking (em). The far end of the tail, not the typical value.
+    /// Tightest tracking (em).
     #[arg(long, default_value_t = -0.18, allow_negative_numbers = true)]
     tracking_min: f32,
 
-    /// Loosest tracking (em). Ordinary text is often set slightly loose, so
-    /// this needs to reach past zero or the model never sees an open line.
-    #[arg(long, default_value_t = 0.04, allow_negative_numbers = true)]
+    /// Loosest tracking (em).
+    #[arg(long, default_value_t = 0.02, allow_negative_numbers = true)]
     tracking_max: f32,
 
     /// Shapes the tracking distribution between the two bounds. 1 is uniform;
     /// above 1 concentrates samples near `--tracking-max` and leaves the tight
-    /// end as a tail. The default puts the median near -0.02 em -- ordinary
-    /// text, slightly tight -- with about a quarter of samples tighter than
-    /// -0.08 em to keep the intersecting-path cases in the corpus.
-    #[arg(long, default_value_t = 1.8)]
+    /// end as a tail.
+    ///
+    /// The default is uniform, and concentrating on realistic tracking was
+    /// measured to be worse -- see the layout augmentation section of the
+    /// README. Breadth here acts as regularisation, so narrowing the
+    /// distribution to match deployment costs accuracy even inside the band
+    /// deployment uses.
+    #[arg(long, default_value_t = 1.0)]
     tracking_skew: f32,
 
-    /// Max per-glyph vertical shift (em). Properly set text has none, and
-    /// baseline alignment is a real cue for grouping, so shaking it hides
-    /// signal rather than adding robustness. Set 0 to disable.
-    #[arg(long, default_value_t = 0.02)]
+    /// Max per-glyph vertical shift (em). Set 0 to disable.
+    #[arg(long, default_value_t = 0.06)]
     baseline_jitter: f32,
 
     /// Horizontal scale applied to the whole line (condensed / extended).
@@ -465,33 +466,50 @@ mod tests {
     }
 
     #[test]
-    fn tracking_defaults_sit_on_ordinary_text() {
-        // "Ordinary, slightly tight" is the target: the median a touch below
-        // zero, a real share of open lines, and the intersecting-path cases
-        // kept as a minority tail rather than most of the corpus.
+    fn tracking_defaults_cover_the_range_evenly() {
+        // The default is deliberately uniform. Skewing it toward realistic
+        // tracking was measured to lose accuracy at every band, so breadth is
+        // the property worth pinning here.
         let args = default_args();
         let mut rng = Pcg64Mcg::seed_from_u64(7);
         let mut values: Vec<f32> = (0..20_000).map(|_| args.tracking(&mut rng)).collect();
         values.sort_by(f32::total_cmp);
 
+        let span = args.tracking_max - args.tracking_min;
         let median = values[values.len() / 2];
-        let loose = values.iter().filter(|&&t| t > 0.0).count() as f32 / values.len() as f32;
-        let tight = values.iter().filter(|&&t| t < -0.08).count() as f32 / values.len() as f32;
-
+        let midpoint = args.tracking_min + span / 2.0;
         assert!(
-            (-0.04..=-0.01).contains(&median),
-            "median tracking {median} should sit just below zero"
+            (median - midpoint).abs() < span * 0.05,
+            "median {median} should sit near the midpoint {midpoint}"
         );
-        assert!(
-            (0.25..=0.5).contains(&loose),
-            "{loose} of samples set loose; ordinary text needs a real share"
-        );
-        assert!(
-            (0.15..=0.35).contains(&tight),
-            "{tight} of samples tighter than -0.08 em; wanted a minority tail"
-        );
+        // Each quarter of the range should hold about a quarter of the draws.
+        for quarter in 0..4 {
+            let lo = args.tracking_min + span * quarter as f32 / 4.0;
+            let hi = lo + span / 4.0;
+            let share =
+                values.iter().filter(|&&t| t >= lo && t < hi).count() as f32 / values.len() as f32;
+            assert!(
+                (0.2..=0.3).contains(&share),
+                "quarter {quarter} holds {share} of samples; expected roughly a quarter"
+            );
+        }
         assert!(*values.first().unwrap() >= args.tracking_min);
         assert!(*values.last().unwrap() <= args.tracking_max);
+    }
+
+    #[test]
+    fn tracking_skew_concentrates_toward_the_loose_end() {
+        // The knob still has to work for anyone re-testing the question.
+        let mut args = default_args();
+        args.tracking_skew = 2.5;
+        let mut rng = Pcg64Mcg::seed_from_u64(3);
+        let values: Vec<f32> = (0..20_000).map(|_| args.tracking(&mut rng)).collect();
+        let mean = values.iter().sum::<f32>() / values.len() as f32;
+        let midpoint = (args.tracking_min + args.tracking_max) / 2.0;
+        assert!(
+            mean > midpoint,
+            "skew above 1 should pull toward tracking_max"
+        );
     }
 
     #[test]
