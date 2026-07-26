@@ -3,3 +3,4 @@
 ## Development
 
 MUST format and commit when you make any changes.
+SHOULD separate commit by convern.
