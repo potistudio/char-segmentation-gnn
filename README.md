@@ -2,6 +2,8 @@
 
 フォント輪郭パスから文字区間を識別する、GNNエッジ分類システム。
 
+<img width="1262" height="430" alt="image" src="https://github.com/user-attachments/assets/e0cdbb55-029e-46e0-a5e9-a562adae2b56" />
+
 ## 構成
 
 Rust(データ生成・推論)と Python(学習)のハイブリッド構成。
