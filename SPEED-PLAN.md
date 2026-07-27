@@ -10,24 +10,44 @@
 
 **出発点: 80.4 ms/行。**
 
-## 到達点（実測）
+## 到達点
 
-| 段階 | 1行あたり | 累積 | 再学習 |
+見積もり（Python + onnxruntime での A/B）と、実装後の実機計測。
+
+| 段階 | 見積もり | **実機（`glyph-infer --cpu`）** | 再学習 |
 | --- | --- | --- | --- |
-| 現状 | 80.4 ms | 1.00x | — |
-| + `ScatterND` 化 | 40.8 ms | **1.97x** | **不要** |
-| + 捨てるエッジを分類器に通さない | 30.4 ms | **2.64x** | **不要** |
-| + `hidden` 128 → 64 | 14.4 ms | 5.59x | 要 |
-| + `layers` 4 → 2 | 7.8 ms | 10.29x | 要 |
+| 現状 | 80.4 ms | 86.19 ms | — |
+| + `ScatterND` 化 | 40.8 ms（1.97x） | — | 不要 |
+| **+ 捨てるエッジを分類器に通さない** | 30.4 ms（2.64x） | **24.12 ms（3.57x）** | 不要 |
+| + `hidden` 128 → 64 | 14.4 ms（5.59x） | 未実施 | 要 |
+| + `layers` 4 → 2 | 7.8 ms（10.29x） | 未実施 | 要 |
 
-上2段は**重みを1ビットも変えない**。グルーピング結果が現行モデルと完全一致することを
-日本語200行 × 閾値 0.4/0.5/0.6/0.7/0.8 で確認済み（1000/1000 一致）。
+**Tier A は完了（3.57倍）。** 見積もりより伸びたのは、Rust 側で戻り値のコピーも
+0.28倍になるぶんが乗るため。ja 一般評価セット 400件 @ 0.60 で
+**完全グルーピング一致率 96.50% が完全一致**、エッジ F1 0.9999・境界 F1 0.9974 も
+小数4桁まで同値。混同セットも 88.00% で一致（8.03 → 2.63 ms）。
+`demo` の17グループも文字単位で完全一致。
+
+`ScatterND` 化後のスレッド特性（ja 一般評価セット）:
+
+| threads | 推論/件 |
+| --- | --- |
+| 1 | 40.54 ms |
+| 4（既定） | 24.95 ms |
+| 12 | 24.82 ms |
+
+**4で頭打ち。既定のままでよい。**
 
 ---
 
-## Tier A: 再学習なしで 2.64倍 ← まずここ
+## Tier A: 再学習なしで 3.57倍 ✅ 完了
 
-### A-1. `ScatterElements` を `ScatterND` に置き換える（1.97倍）
+### A-1. `ScatterElements` を `ScatterND` に置き換える（1.97倍）✅
+
+実装: [model.py](training/glyph_gnn/model.py) の `segment_add` / `row_wise_scatter`、
+[export_onnx.py](training/glyph_gnn/export_onnx.py) の `force_scatter_add`。
+学習経路は `scatter_add_` のままで、旧式との一致を順伝播・逆伝播ともに
+**ビット単位で確認済み**（差 0.000e+00）。
 
 README の計測どおり `ScatterElements` が CPU 時間の 43.4% を占めていた。**原因は
 op の選択ミス**で、アルゴリズムのせいではない。
@@ -89,7 +109,11 @@ for node in model.graph.node:
 
 **工数見込み: 0.5日**（うち半分は検査の作り直し）
 
-### A-2. 捨てられるエッジを分類器に通さない（さらに 1.34倍）
+### A-2. 捨てられるエッジを分類器に通さない（さらに 1.34倍）✅
+
+実装: ONNX の `scored` 入力（[export_onnx.py](training/glyph_gnn/export_onnx.py) の
+`InferenceWrapper`）と、[main.rs](crates/glyph-infer/src/main.rs) の
+`Engine::scored_edges`。`scored` を持たない古い ONNX もそのまま読める。
 
 [postprocess.rs:67-69](crates/glyph-infer/src/postprocess.rs#L67-L69) は同一輪郭内の
 エッジを `continue` で読み飛ばす。判定単位が輪郭ペアだから当然だが、つまり
@@ -127,19 +151,27 @@ def forward(self, x, edge_index, edge_attr, cid, cattr, scored):
         hx, summary, edge_index[:, scored], edge_attr[scored], cid, cattr, None))
 ```
 
-Rust 側は `graph.rs` が `same_contour` を既に持っているので、
-`edge_features[i*4+3] == 0.0` のインデックスを集めて渡すだけ。
-`postprocess.rs` は `probs[i]` の添字を `scored[i]` に読み替える。
-
 メッセージパッシング（`trunk`）は全エッジで回すので**受容野も精度も変わらない**。
 
-- 出力テンソルも 0.28倍になるので、Rust への戻しコピーも減る
-- `glyph-infer eval` の**点エッジ単位の P/R/F1 は測れなくなる**。輪郭ペア単位の
-  指標は残るので実害はないが、README の数字と直接は比べられなくなる
-- GUI のエッジ重ね描きも同一輪郭内が消える。診断用に全エッジ版を別エクスポートするか、
-  `scored` に全インデックスを渡せば従来どおり動く（入力が可変なので分岐は要らない）
+Rust 側は `Engine::scored_edges` が `node_contour_ids` を突き合わせてインデックスを作り、
+返ってきた確率を**全長の配列に戻す**。同一輪郭内は 1.0 で埋める。
 
-**工数見込み: 0.5日**
+**1.0 は仮の値ではなく正解ラベルそのもの。** 輪郭は必ず1文字に属する
+（[graph.rs](crates/glyph-core/src/graph.rs) の `ContourInstance.char_id`）ので、
+両端が同じ輪郭のエッジは定義上いつも同一文字。この性質のおかげで、
+`postprocess.rs`・`export.rs`・`eval` のどれにも手を入れずに済んだ。
+
+- 出力テンソルも 0.28倍になるので、Rust への戻しコピーも減る
+  （見積もり 2.64倍に対して実機 3.57倍だったのはこの分）
+- `glyph-infer eval` の**点エッジ単位の P/R/F1 は、同一輪郭内が正解で埋まる分だけ
+  甘くなる**。実測では小数4桁まで変わらなかった（モデルがそこを外さないため）が、
+  厳密には**モデル単体の指標ではなくなった**。輪郭ペア単位の指標は影響なし
+- GUI のエッジ重ね描きは従来どおり。`scored` に全インデックスを渡せば
+  元の挙動にも戻せる（入力が可変なので分岐は要らない）
+- 輪郭が1つしかない行では `scored` が空になる。その場合はセッションを回さず
+  全部 1.0 を返す（決めることが何もないので）
+
+**工数実績: 0.5日**
 
 ---
 
@@ -235,22 +267,27 @@ Tier A を入れたあとで実測してから判断する。
 
 ## 推奨する実施順序
 
-1. **A-1（`ScatterND`）** — 1.97倍、再学習なし、半日。`reduction` 属性の罠に注意
-2. **A-2（分類するエッジを絞る）** — さらに 1.34倍、再学習なし、半日
-3. ここで **30 ms/行**。前処理の実測を取り直して、必要なら bbox 足切り
+1. ~~**A-1（`ScatterND`）**~~ — **完了**。`reduction` 属性の罠は `force_scatter_add` で封じた
+2. ~~**A-2（分類するエッジを絞る）**~~ — **完了**。合わせて **24.12 ms/行（3.57倍）**
+3. 前処理が 3.7ms = 全体の 13% になった。必要なら bbox 足切り ← 次はここ
 4. **B-1（蒸留で細くする）** — 精度の許容範囲を測りながら。ここが本番
 5. 足りなければ **B-2（グラフを粗く）**、それでも足りなければ **C（自作ランタイム）**
 
 ## 検証方法
 
-A の2段は精度が変わらないはずなので、**グルーピング一致で検査する**。
+A の2段は精度が変わらないので、**グルーピング一致で検査する**。
 
 ```bash
-uv run python -m glyph_gnn.eval --checkpoint ... --data dataset/ab-eval-general
-cargo run --release -p glyph-infer -- --model model.onnx --cpu \
-    eval --shard dataset/ab-eval-general/shard_00000.msgpack
+# エクスポート時に自動で走る（グルーピングが閾値 0.3〜0.9 で一致するか）
+uv run python -m glyph_gnn.export_onnx --checkpoint training/checkpoints/ab-mix/best.pt \
+    --out model.onnx
+
+# 旧 ONNX と新 ONNX を同じシャードに当てて突き合わせる
+cargo run --release -p glyph-infer -- --model model.onnx --cpu --threshold 0.60 \
+    eval --shard dataset/ab-eval-general/shard_00000.msgpack --limit 400
 ```
 
-`export_onnx.py` のパリティ検査は 1e-4 では通らなくなるので、
-**ペア確率の一致**か**グルーピングの一致**に置き換えること。数値のずれ
-（1e-3 台）は `ScatterND` の加算順序が非決定的なせいで、バグではない。
+`export_onnx.py` のパリティ検査は数値一致からグルーピング一致に変えてある。
+数値のずれ（1e-3 台）は `ScatterND` の加算順序が非決定的なせいで、バグではない。
+`segment_add` の学習経路（`scatter_add_`）は旧式とビット単位で一致することを
+確認済みなので、**学習をやり直す必要はない**。
