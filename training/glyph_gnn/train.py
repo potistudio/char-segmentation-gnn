@@ -391,6 +391,19 @@ def main() -> None:
         radius=args.radius,
         contour_bridge=args.contour_bridge,
         stack_bridge=args.stack_bridge,
+        # Provenance, not model shape: `model_hparams` and `graph_hparams` both
+        # filter these out on load. What they answer is "which numbers is this
+        # checkpoint's accuracy comparable to". The split holds out whole fonts
+        # chosen by the seed, so two runs that differ in any of the first three
+        # were scored on different fonts and their accuracies cannot be put in
+        # the same table -- a seed change alone moved a validation set by 4
+        # graphs and 7k contour pairs here. `epochs` belongs with them because
+        # the cosine schedule is scaled to it, so a 10-epoch run is not the
+        # first half of a 20-epoch one.
+        seed=args.seed,
+        val_frac=args.val_frac,
+        random_split=args.random_split,
+        epochs=args.epochs,
     )
     optim = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(optim, T_max=args.epochs)
