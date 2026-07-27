@@ -61,22 +61,32 @@ struct Args {
     #[arg(
         long,
         default_value = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789",
-        conflicts_with_all = ["charset_file", "text_file"]
+        conflicts_with = "charset_file"
     )]
     charset: String,
 
     /// UTF-8 text file listing drawable characters. Lines starting with `#` and
     /// blank lines are skipped; all other characters on each line join the pool.
     /// Duplicate characters increase sampling weight.
-    #[arg(long, conflicts_with_all = ["charset", "text_file"])]
+    #[arg(long, conflicts_with = "charset")]
     charset_file: Option<PathBuf>,
 
     /// UTF-8 file of fixed texts, one per line, rendered round-robin instead of
     /// sampling random strings. Every line gets the same number of samples with
     /// different fonts and augmentation, which is what makes a per-pattern
     /// breakdown comparable. `--min-chars` / `--max-chars` do not apply.
-    #[arg(long, conflicts_with_all = ["charset", "charset_file"])]
+    ///
+    /// Combine with `--text-ratio` below 1 to splice the patterns into random
+    /// text instead, which is how they get into a training corpus.
+    #[arg(long)]
     text_file: Option<PathBuf>,
+
+    /// Share of samples taken from `--text-file`. At 1 (the default) the file is
+    /// the whole corpus, which is what an evaluation set wants. Below 1 the
+    /// patterns are spliced into random text drawn from the charset, so a
+    /// training corpus can carry adjacencies a random pool never produces.
+    #[arg(long, default_value_t = 1.0)]
+    text_ratio: f64,
 
     /// Graph construction: max neighbors per node.
     #[arg(long, default_value_t = 8)]
@@ -245,6 +255,22 @@ enum TextSource {
     Charset(Vec<char>),
     /// A fixed list rendered round-robin, for per-pattern evaluation.
     Fixed(Vec<String>),
+    /// Fixed patterns spliced into random text some of the time.
+    ///
+    /// A random pool of 3,417 characters produces a given adjacent pair -- "ll",
+    /// "一二" -- about 0.05 times in 100k lines, so the confusable sequences that
+    /// dominate the error are effectively absent from training even though every
+    /// character in them is seen hundreds of times. This puts them in on purpose.
+    ///
+    /// The patterns are spliced into a line rather than emitted alone: half of
+    /// them are a single character, and the model leans on line context to judge
+    /// character pitch, so standalone patterns would train it on lines that have
+    /// no context to read.
+    Mixed {
+        charset: Vec<char>,
+        texts: Vec<String>,
+        ratio: f64,
+    },
 }
 
 impl TextSource {
@@ -252,19 +278,37 @@ impl TextSource {
         match self {
             TextSource::Charset(chars) => format!("{} chars", chars.len()),
             TextSource::Fixed(texts) => format!("{} fixed texts", texts.len()),
+            TextSource::Mixed {
+                charset,
+                texts,
+                ratio,
+            } => format!(
+                "{} chars + {} patterns spliced in at {:.0}%",
+                charset.len(),
+                texts.len(),
+                ratio * 100.0
+            ),
         }
     }
 }
 
 fn resolve_text_source(args: &Args) -> Result<TextSource> {
-    if let Some(path) = &args.text_file {
-        let texts = load_text_file(path)?;
-        println!(
-            "texts loaded from {} ({} lines)",
-            path.display(),
-            texts.len()
-        );
-        return Ok(TextSource::Fixed(texts));
+    let fixed = match &args.text_file {
+        Some(path) => {
+            let texts = load_text_file(path)?;
+            println!(
+                "texts loaded from {} ({} lines)",
+                path.display(),
+                texts.len()
+            );
+            Some(texts)
+        }
+        None => None,
+    };
+    if let Some(texts) = &fixed {
+        if args.text_ratio >= 1.0 {
+            return Ok(TextSource::Fixed(texts.clone()));
+        }
     }
     let charset_str = if let Some(path) = &args.charset_file {
         let loaded = load_charset_file(path)?;
@@ -281,7 +325,14 @@ fn resolve_text_source(args: &Args) -> Result<TextSource> {
     if charset.is_empty() {
         bail!("charset is empty");
     }
-    Ok(TextSource::Charset(charset))
+    Ok(match fixed {
+        Some(texts) => TextSource::Mixed {
+            charset,
+            texts,
+            ratio: args.text_ratio,
+        },
+        None => TextSource::Charset(charset),
+    })
 }
 
 fn random_text(rng: &mut Pcg64Mcg, charset: &[char], min: usize, max: usize) -> String {
@@ -289,6 +340,30 @@ fn random_text(rng: &mut Pcg64Mcg, charset: &[char], min: usize, max: usize) -> 
     (0..len)
         .map(|_| charset[rng.random_range(0..charset.len())])
         .collect()
+}
+
+/// Splices `pattern` into a line of random characters, keeping the overall
+/// length inside `min..=max` so the corpus keeps one length distribution.
+fn embed_pattern(
+    rng: &mut Pcg64Mcg,
+    charset: &[char],
+    pattern: &str,
+    min: usize,
+    max: usize,
+) -> String {
+    let len = pattern.chars().count();
+    let total = rng.random_range(min.max(len)..=max.max(len));
+    let pad = total - len;
+    let before = rng.random_range(0..=pad);
+    let mut out = String::new();
+    for _ in 0..before {
+        out.push(charset[rng.random_range(0..charset.len())]);
+    }
+    out.push_str(pattern);
+    for _ in 0..(pad - before) {
+        out.push(charset[rng.random_range(0..charset.len())]);
+    }
+    out
 }
 
 fn generate_one(
@@ -315,6 +390,20 @@ fn generate_one(
         // number of samples; a per-pattern accuracy is only comparable when
         // the denominators match.
         TextSource::Fixed(texts) => texts[idx % texts.len()].clone(),
+        TextSource::Mixed {
+            charset,
+            texts,
+            ratio,
+        } => {
+            if rng.random_range(0.0..1.0) < *ratio {
+                // Round-robin here too, so every pattern is trained on equally
+                // often regardless of how many samples land in the mix.
+                let pattern = &texts[idx % texts.len()];
+                embed_pattern(&mut rng, charset, pattern, args.min_chars, args.max_chars)
+            } else {
+                random_text(&mut rng, charset, args.min_chars, args.max_chars)
+            }
+        }
     };
 
     let layout_cfg = LayoutConfig {
@@ -529,6 +618,52 @@ mod tests {
         for _ in 0..100 {
             assert!((args.tracking(&mut rng) - -0.1).abs() < 1e-6);
         }
+    }
+
+    #[test]
+    fn embedded_patterns_keep_the_line_length_distribution() {
+        // Splicing must not turn 15% of the corpus into one-character lines:
+        // the model reads character pitch off the line, so a pattern with no
+        // neighbours teaches it about a line that cannot be read.
+        let args = default_args();
+        let charset: Vec<char> = "あいうえおかきくけこ".chars().collect();
+        let mut rng = Pcg64Mcg::seed_from_u64(5);
+        for pattern in ["二", "ll", "一二三"] {
+            for _ in 0..200 {
+                let text =
+                    embed_pattern(&mut rng, &charset, pattern, args.min_chars, args.max_chars);
+                let len = text.chars().count();
+                assert!(
+                    (args.min_chars..=args.max_chars).contains(&len),
+                    "{pattern:?} produced a {len}-character line"
+                );
+                assert!(text.contains(pattern), "{text:?} lost the pattern");
+            }
+        }
+    }
+
+    #[test]
+    fn text_ratio_one_keeps_the_file_as_the_whole_corpus() {
+        // An evaluation set needs the patterns verbatim and equally weighted.
+        let dir = std::env::temp_dir().join(format!("mix_test_{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("t.txt");
+        fs::write(&path, "ll\n\u{4e8c}\n").unwrap();
+
+        let mut args = default_args();
+        args.text_file = Some(path);
+        assert!(matches!(
+            resolve_text_source(&args).unwrap(),
+            TextSource::Fixed(_)
+        ));
+
+        args.text_ratio = 0.15;
+        assert!(matches!(
+            resolve_text_source(&args).unwrap(),
+            TextSource::Mixed { .. }
+        ));
+
+        fs::remove_dir_all(dir).ok();
     }
 
     #[test]
