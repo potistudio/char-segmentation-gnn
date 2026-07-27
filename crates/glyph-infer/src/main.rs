@@ -61,6 +61,11 @@ struct Args {
     #[arg(long, conflicts_with = "cpu")]
     directml: bool,
 
+    /// Intra-op threads. CPU inference is compute-bound and scales with this;
+    /// a host that owns the machine's cores may want fewer than the default.
+    #[arg(long, default_value_t = 4)]
+    threads: usize,
+
     #[command(subcommand)]
     cmd: Command,
 }
@@ -117,13 +122,13 @@ struct Engine {
 }
 
 impl Engine {
-    fn new(model: &PathBuf, backend: Backend, threshold: f32) -> Result<Self> {
+    fn new(model: &PathBuf, backend: Backend, threads: usize, threshold: f32) -> Result<Self> {
         let base = || -> Result<_> {
             Session::builder()
                 .map_err(ort_err)?
                 .with_optimization_level(GraphOptimizationLevel::Level3)
                 .map_err(ort_err)?
-                .with_intra_threads(4)
+                .with_intra_threads(threads)
                 .map_err(ort_err)
         };
 
@@ -230,7 +235,7 @@ fn main() -> Result<()> {
         (_, true) => Backend::DirectML,
         _ => Backend::Cuda,
     };
-    let mut engine = Engine::new(&args.model, backend, args.threshold)?;
+    let mut engine = Engine::new(&args.model, backend, args.threads, args.threshold)?;
     let graph_cfg = graph_config(
         args.knn,
         args.radius,
