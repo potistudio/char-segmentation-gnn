@@ -9,14 +9,15 @@
 mod export;
 mod postprocess;
 
+use std::borrow::Cow;
 use std::path::PathBuf;
 use std::time::Instant;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use ort::ep::{CUDA, DirectML};
-use ort::session::Session;
 use ort::session::builder::GraphOptimizationLevel;
+use ort::session::{Session, SessionInputValue};
 use ort::value::Tensor;
 use rand::SeedableRng;
 use rand_pcg::Pcg64Mcg;
@@ -119,9 +120,22 @@ enum Backend {
 struct Engine {
     session: Session,
     threshold: f32,
+    /// Whether the model takes a `scored` input, i.e. runs its classifier on a
+    /// chosen subset of the edges. Models exported before that input exists
+    /// score every edge, so both shapes stay loadable.
+    selective: bool,
 }
 
 impl Engine {
+    fn wrap(session: Session, threshold: f32) -> Self {
+        let selective = session.inputs().iter().any(|i| i.name() == "scored");
+        Self {
+            session,
+            threshold,
+            selective,
+        }
+    }
+
     fn new(model: &PathBuf, backend: Backend, threads: usize, threshold: f32) -> Result<Self> {
         let base = || -> Result<_> {
             Session::builder()
@@ -163,7 +177,7 @@ impl Engine {
             match builder.and_then(|mut b| b.commit_from_file(model).map_err(ort_err)) {
                 Ok(session) => {
                     eprintln!("execution provider: {name}");
-                    return Ok(Self { session, threshold });
+                    return Ok(Self::wrap(session, threshold));
                 }
                 Err(e) => {
                     eprintln!("warning: {name} EP unavailable ({e}); falling back to CPU");
@@ -176,7 +190,24 @@ impl Engine {
             .map_err(ort_err)
             .with_context(|| format!("loading {}", model.display()))?;
         eprintln!("execution provider: CPU");
-        Ok(Self { session, threshold })
+        Ok(Self::wrap(session, threshold))
+    }
+
+    /// Which edges the model has to score.
+    ///
+    /// [`group_characters`] folds edges into contour pairs and skips any whose
+    /// endpoints share a contour -- 72% of them on Japanese text. Those rows
+    /// were being computed and discarded, and the classifier costs about 37x
+    /// more per edge than the attention layers do, so they were most of the
+    /// per-edge work. Message passing still runs over the full edge list, so
+    /// nothing about the receptive field changes.
+    fn scored_edges(g: &GraphSample) -> Vec<i64> {
+        let e = g.num_edges();
+        let (src, dst) = g.edge_index.split_at(e);
+        (0..e)
+            .filter(|&i| g.node_contour_ids[src[i] as usize] != g.node_contour_ids[dst[i] as usize])
+            .map(|i| i as i64)
+            .collect()
     }
 
     /// Runs the model on a prebuilt graph. Returns per-edge probabilities.
@@ -187,6 +218,19 @@ impl Engine {
         let edge_dim = g.edge_dim as usize;
         let c = g.num_contours as usize;
         let contour_dim = g.contour_dim as usize;
+
+        let scored = if self.selective {
+            Self::scored_edges(g)
+        } else {
+            (0..e as i64).collect()
+        };
+        // A contour belongs to exactly one character, so an edge with both ends
+        // in the same contour is same-character by construction. 1.0 is its
+        // label, not a placeholder, which is what lets the eval metrics and the
+        // GUI overlay keep reading a full-length array.
+        if scored.is_empty() {
+            return Ok(vec![1.0; e]);
+        }
 
         // i64 indices as required by the ONNX graph (torch.long).
         let edge_index: Vec<i64> = g.edge_index.iter().map(|&v| v as i64).collect();
@@ -201,20 +245,30 @@ impl Engine {
         let cattr =
             Tensor::from_array(([c, contour_dim], g.contour_features.clone())).map_err(ort_err)?;
 
-        let outputs = self
-            .session
-            .run(ort::inputs![
-                "node_features" => nodes,
-                "edge_index" => edges,
-                "edge_features" => eattr,
-                "node_contour_ids" => cids,
-                "contour_features" => cattr,
-            ])
-            .map_err(ort_err)?;
+        let mut feed = ort::inputs![
+            "node_features" => nodes,
+            "edge_index" => edges,
+            "edge_features" => eattr,
+            "node_contour_ids" => cids,
+            "contour_features" => cattr,
+        ];
+        if self.selective {
+            let picked = Tensor::from_array(([scored.len()], scored.clone())).map_err(ort_err)?;
+            feed.push((Cow::from("scored"), SessionInputValue::from(picked)));
+        }
+
+        let outputs = self.session.run(feed).map_err(ort_err)?;
         let (_, probs) = outputs["edge_probs"]
             .try_extract_tensor::<f32>()
             .map_err(ort_err)?;
-        Ok(probs.to_vec())
+        if !self.selective {
+            return Ok(probs.to_vec());
+        }
+        let mut full = vec![1.0f32; e];
+        for (slot, &edge) in scored.iter().enumerate() {
+            full[edge as usize] = probs[slot];
+        }
+        Ok(full)
     }
 }
 
