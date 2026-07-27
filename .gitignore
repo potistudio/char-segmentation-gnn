@@ -10,6 +10,7 @@ __pycache__/
 
 # Artifacts
 *.onnx
+*.gnnw
 training/checkpoints/
 
 # Assets
