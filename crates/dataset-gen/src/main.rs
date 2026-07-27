@@ -146,6 +146,19 @@ struct Args {
     /// Max uniform jitter added to every outline point (em).
     #[arg(long, default_value_t = 0.004)]
     point_noise: f32,
+
+    /// Multiplies the em used to normalize the graph, without touching the
+    /// geometry. A host that feeds raw outlines has to estimate the em itself
+    /// -- vector art carries no upem -- and every graph radius is expressed in
+    /// it, so this measures what a wrong estimate costs. 1.0 is exact.
+    #[arg(long, default_value_t = 1.0)]
+    upem_scale: f32,
+
+    /// Shifts the whole line vertically before graph construction (em).
+    /// x is normalized against the leftmost point but y is used raw, so a host
+    /// that guesses the baseline wrong shifts every y feature by this much.
+    #[arg(long, default_value_t = 0.0, allow_negative_numbers = true)]
+    baseline_shift: f32,
 }
 
 impl Args {
@@ -172,6 +185,9 @@ impl Args {
         }
         if self.tracking_skew <= 0.0 {
             bail!("--tracking-skew must be positive");
+        }
+        if self.upem_scale <= 0.0 {
+            bail!("--upem-scale must be positive");
         }
         if self.baseline_jitter < 0.0 || self.point_noise < 0.0 {
             bail!("--baseline-jitter and --point-noise cannot be negative");
@@ -415,8 +431,16 @@ fn generate_one(
         point_noise: rng.random_range(0.0f32..=args.point_noise),
     };
 
-    let (contours, upem) = layout_text(&font.data, &text, &layout_cfg, &mut rng).ok()?;
-    let mut sample = build_graph(&contours, upem, graph_cfg);
+    let (mut contours, upem) = layout_text(&font.data, &text, &layout_cfg, &mut rng).ok()?;
+    if args.baseline_shift != 0.0 {
+        let dy = args.baseline_shift * upem;
+        for inst in &mut contours {
+            for p in &mut inst.contour.points {
+                p[1] += dy;
+            }
+        }
+    }
+    let mut sample = build_graph(&contours, upem * args.upem_scale, graph_cfg);
     if sample.num_nodes < 8 || sample.num_edges() == 0 {
         return None;
     }
