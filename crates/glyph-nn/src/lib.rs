@@ -17,5 +17,5 @@ pub mod model;
 pub mod ops;
 pub mod weights;
 
-pub use model::Model;
+pub use model::{Model, Stages};
 pub use weights::{HParams, LoadError, Weights};

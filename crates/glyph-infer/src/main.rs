@@ -136,6 +136,9 @@ enum Runtime {
 struct Engine {
     runtime: Runtime,
     threshold: f32,
+    /// Per-stage time, accumulated across every graph the engine has seen.
+    /// Only the native path fills it; onnxruntime has its own profiler.
+    stages: glyph_nn::Stages,
 }
 
 impl Engine {
@@ -144,6 +147,7 @@ impl Engine {
         Self {
             runtime: Runtime::Ort { session, selective },
             threshold,
+            stages: glyph_nn::Stages::default(),
         }
     }
 
@@ -154,6 +158,7 @@ impl Engine {
         Ok(Self {
             runtime: Runtime::Native(model),
             threshold,
+            stages: glyph_nn::Stages::default(),
         })
     }
 
@@ -259,7 +264,7 @@ impl Engine {
 
         if let Runtime::Native(model) = &self.runtime {
             let picked: Vec<u32> = scored.iter().map(|&v| v as u32).collect();
-            let probs = model.run(g, &picked);
+            let probs = model.run_timed(g, &picked, &mut self.stages);
             let mut full = vec![1.0f32; e];
             for (slot, &edge) in scored.iter().enumerate() {
                 full[edge as usize] = probs[slot];
@@ -476,5 +481,17 @@ fn eval(engine: &mut Engine, shard: &PathBuf, limit: usize) -> Result<()> {
         sum_inf / n,
         sum_post / n
     );
+    // Only the native runtime fills these; onnxruntime reports its own.
+    let stages = engine.stages;
+    if stages.total() > 0.0 {
+        println!("native stages, ms per sample (longest first):");
+        for (name, ms) in stages.ranked() {
+            println!(
+                "  {name:11} {:6.2}ms  {:5.1}%",
+                ms / n,
+                ms / stages.total() * 100.0
+            );
+        }
+    }
     Ok(())
 }

@@ -76,6 +76,50 @@ fn sigmoid(v: f32) -> f32 {
     1.0 / (1.0 + (-v).exp())
 }
 
+/// Wall time per stage, in milliseconds, summed over however many graphs were
+/// run. Filled by [`Model::run_timed`].
+#[derive(Debug, Default, Clone, Copy)]
+pub struct Stages {
+    /// Building the incoming-edge index and the contour relation table.
+    pub setup: f64,
+    pub encoder: f64,
+    /// The point-level attention rounds.
+    pub gat: f64,
+    /// The contour supernode rounds.
+    pub contour: f64,
+    /// Graph-level pooling and its MLP.
+    pub context: f64,
+    pub classifier: f64,
+}
+
+impl Stages {
+    pub fn total(&self) -> f64 {
+        self.setup + self.encoder + self.gat + self.contour + self.context + self.classifier
+    }
+
+    /// Longest first, so a caller can print them in the order that matters.
+    pub fn ranked(&self) -> Vec<(&'static str, f64)> {
+        let mut rows = vec![
+            ("setup", self.setup),
+            ("encoder", self.encoder),
+            ("gat", self.gat),
+            ("contour", self.contour),
+            ("context", self.context),
+            ("classifier", self.classifier),
+        ];
+        rows.sort_by(|a, b| b.1.total_cmp(&a.1));
+        rows
+    }
+}
+
+/// Adds the time `body` takes to `slot`.
+fn timed<T>(slot: &mut f64, body: impl FnOnce() -> T) -> T {
+    let started = std::time::Instant::now();
+    let out = body();
+    *slot += started.elapsed().as_secs_f64() * 1e3;
+    out
+}
+
 pub struct Model {
     w: Weights,
 }
@@ -97,17 +141,46 @@ impl Model {
     /// selects which edges reach the classifier, exactly as the `scored` input
     /// does on the ONNX path.
     pub fn run(&self, g: &GraphSample, scored: &[u32]) -> Vec<f32> {
+        self.run_timed(g, scored, &mut Stages::default())
+    }
+
+    /// [`run`](Self::run), adding to a per-stage time budget.
+    ///
+    /// Optimising this runtime without it is guesswork, and guesswork is what
+    /// produced the wrong bottleneck twice already.
+    pub fn run_timed(&self, g: &GraphSample, scored: &[u32], stages: &mut Stages) -> Vec<f32> {
         let hp = self.w.hparams;
         let n = g.num_nodes as usize;
         let e = g.num_edges();
         let c = g.num_contours as usize;
         let hidden = hp.hidden;
         let (src, dst) = g.edge_index.split_at(e);
-        let incoming = Incoming::build(dst, n);
+
+        // Geometry does not change between rounds, so the all-pairs table is
+        // built once and every layer reads its bias off it.
+        let (incoming, relations) = timed(&mut stages.setup, || {
+            let incoming = Incoming::build(dst, n);
+            let relations = (hp.contours && hp.relations).then(|| {
+                let mut table = vec![0.0f32; c * c * CONTOUR_RELATIONS];
+                let dim = hp.contour_dim;
+                for i in 0..c {
+                    for j in 0..c {
+                        let at = (i * c + j) * CONTOUR_RELATIONS;
+                        relations_of(
+                            &g.contour_features[i * dim..(i + 1) * dim],
+                            &g.contour_features[j * dim..(j + 1) * dim],
+                            &mut table[at..at + CONTOUR_RELATIONS],
+                        );
+                    }
+                }
+                table
+            });
+            (incoming, relations)
+        });
 
         // --- node encoder: Linear -> ReLU -> Linear -> LayerNorm ---
         let mut hx = vec![0.0f32; n * hidden];
-        {
+        timed(&mut stages.encoder, || {
             let mut first = vec![0.0f32; n * hidden];
             linear(
                 &g.node_features,
@@ -130,65 +203,56 @@ impl Model {
                 self.w.get("encoder.3.weight"),
                 self.w.get("encoder.3.bias"),
             );
-        }
-
-        // Geometry does not change between rounds, so the all-pairs table is
-        // built once and every layer reads its bias off it.
-        let relations = (hp.contours && hp.relations).then(|| {
-            let mut table = vec![0.0f32; c * c * CONTOUR_RELATIONS];
-            let dim = hp.contour_dim;
-            for i in 0..c {
-                for j in 0..c {
-                    let at = (i * c + j) * CONTOUR_RELATIONS;
-                    relations_of(
-                        &g.contour_features[i * dim..(i + 1) * dim],
-                        &g.contour_features[j * dim..(j + 1) * dim],
-                        &mut table[at..at + CONTOUR_RELATIONS],
-                    );
-                }
-            }
-            table
         });
 
         for depth in 0..hp.layers {
-            self.gat_layer(depth, &mut hx, src, dst, g, &incoming);
+            timed(&mut stages.gat, || {
+                self.gat_layer(depth, &mut hx, src, dst, g, &incoming)
+            });
             if hp.contours {
-                self.contour_layer(depth, &mut hx, g, relations.as_deref());
+                timed(&mut stages.contour, || {
+                    self.contour_layer(depth, &mut hx, g, relations.as_deref())
+                });
             }
         }
 
         // --- graph summary: mean and max over every node ---
-        let summary = hp.context.then(|| {
-            let mut pooled = vec![f32::NEG_INFINITY; 2 * hidden];
-            for (i, slot) in pooled[..hidden].iter_mut().enumerate() {
-                *slot = 0.0;
-                for row in 0..n {
-                    *slot += hx[row * hidden + i];
+        let mut summary = None;
+        timed(&mut stages.context, || {
+            summary = hp.context.then(|| {
+                let mut pooled = vec![f32::NEG_INFINITY; 2 * hidden];
+                for (i, slot) in pooled[..hidden].iter_mut().enumerate() {
+                    *slot = 0.0;
+                    for row in 0..n {
+                        *slot += hx[row * hidden + i];
+                    }
+                    *slot /= n.max(1) as f32;
                 }
-                *slot /= n.max(1) as f32;
-            }
-            for row in 0..n {
-                for i in 0..hidden {
-                    let v = hx[row * hidden + i];
-                    let slot = &mut pooled[hidden + i];
-                    if v > *slot {
-                        *slot = v;
+                for row in 0..n {
+                    for i in 0..hidden {
+                        let v = hx[row * hidden + i];
+                        let slot = &mut pooled[hidden + i];
+                        if v > *slot {
+                            *slot = v;
+                        }
                     }
                 }
-            }
-            let mut out = vec![0.0f32; hidden];
-            linear(
-                &pooled,
-                1,
-                self.w.get("context.0.weight"),
-                self.w.get("context.0.bias"),
-                &mut out,
-            );
-            relu(&mut out);
-            out
+                let mut out = vec![0.0f32; hidden];
+                linear(
+                    &pooled,
+                    1,
+                    self.w.get("context.0.weight"),
+                    self.w.get("context.0.bias"),
+                    &mut out,
+                );
+                relu(&mut out);
+                out
+            })
         });
 
-        self.classify(g, &hx, summary.as_deref(), relations.as_deref(), scored)
+        timed(&mut stages.classifier, || {
+            self.classify(g, &hx, summary.as_deref(), relations.as_deref(), scored)
+        })
     }
 
     /// One round of edge-aware attention. Mirrors `EdgeGATLayer.forward`.
@@ -209,7 +273,6 @@ impl Model {
 
         let mut h_src = vec![0.0f32; n * hidden];
         let mut h_dst = vec![0.0f32; n * hidden];
-        let mut h_edge = vec![0.0f32; e * hidden];
         linear(
             hx,
             n,
@@ -224,6 +287,7 @@ impl Model {
             self.w.get(&p("lin_dst.bias")),
             &mut h_dst,
         );
+        let mut h_edge = vec![0.0f32; e * hidden];
         linear(
             &g.edge_features,
             e,
@@ -291,15 +355,15 @@ impl Model {
         );
 
         // Residual around the projected aggregate, then LayerNorm.
-        let mut projected = vec![0.0f32; n * hidden];
+        let mut mixed = vec![0.0f32; n * hidden];
         linear(
             &agg,
             n,
             self.w.get(&p("out.weight")),
             self.w.get(&p("out.bias")),
-            &mut projected,
+            &mut mixed,
         );
-        for (slot, add) in hx.iter_mut().zip(&projected) {
+        for (slot, add) in hx.iter_mut().zip(&mixed) {
             *slot += add;
         }
         layer_norm(
