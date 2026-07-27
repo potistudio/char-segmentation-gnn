@@ -440,7 +440,8 @@ cargo run --release -p glyph-infer -- --model model.onnx \
     eval --shard dataset/eval/shard_00000.msgpack
 ```
 
-- 既定で CUDA Execution Provider を登録(RTX 3060)。`--cpu` で CPU 実行
+- 既定で CUDA Execution Provider を登録(RTX 3060)。`--cpu` で CPU 実行、
+  `--directml` で DirectML(後述のとおり遅いので比較用)
 - `--threshold` でエッジ結合確率の判定閾値を調整。**このモデル用の値は学習ログの
   閾値スイープか `glyph_gnn.eval` で決めること**
   - ja-lyric フルコーパスの30エポック学習では **0.50** が最良で、0.30〜0.75 は
@@ -478,6 +479,55 @@ PATH=".venv/Lib/site-packages/torch/lib:$PATH" \
   失敗した場合は警告を出して CPU にフォールバックする
 - 初回推論は CUDA カーネル初期化で数百 ms かかるため、レイテンシ計測は
   ウォームアップ後に行うこと(`eval` モードは自動でウォームアップする)
+
+### 実行プロバイダの比較 — DirectML は不採用
+
+CUDA は cuDNN と cuBLAS を引き連れてくるので配布物が重い。単一 DLL で済み
+ベンダーも問わない DirectML(`--directml`)を代案として測ったが、**CPU より遅かった**。
+
+ja-lyric 一般評価セット 400サンプル、RTX 3060、`ab.onnx` @ 0.60:
+
+| EP | 推論/件 | 一致率 | 追加で配る DLL |
+| ---------- | ------------- | ------ | -------------- |
+| **CUDA** | **6.27 ms** | 96.50% | 約 823 MB |
+| CPU | 84.67 ms | 96.50% | 0 |
+| DirectML | 110.29 ms | 96.50% | 17.7 MB |
+
+- **精度は3つとも完全一致**(F1 まで同値)。差は速度だけ
+- DirectML が遅いのは形状ごとにカーネルを組み直すから。同じ形状を続けて投げると
+  110 → 64ms まで改善するが、それでも CUDA の10倍
+- モデルは 844 ノードあり、うち `Shape` / `Reshape` / `ConstantOfShape` 系が 94個。
+  動的形状のこれらは DML に載らず CPU へ落ちるので、パーティションが細切れになる
+- CUDA の 6.27ms も 844 × 約7µs のカーネル起動でほぼ説明がつく。**計算ではなく
+  起動律速**なので、速度が要るならオペ数を減らすほうが効く
+
+#### cuDNN の最小構成
+
+CUDA EP は畳み込みを1つも使わないモデルでも `onnxruntime_providers_cuda.dll` の
+リンク時依存として cuDNN を要求する。PyTorch 同梱の一式は 1.64 GiB あるが、
+1枚ずつ抜いて実測したところ **731 MB まで削っても速度は変わらない**。
+
+| DLL | サイズ | |
+| ------------------------------------- | -------- | -------- |
+| cublasLt64_12.dll | 507.2 MB | 必須 |
+| cudnn_ops64_9.dll | 120.6 MB | 必須 |
+| cublas64_12.dll | 100.0 MB | 必須 |
+| cudnn_graph64_9.dll | 2.3 MB | 必須(`cudnnCreate`) |
+| cudart64_12.dll | 0.5 MB | 必須 |
+| cudnn64_9.dll | 0.3 MB | 必須(ローダー) |
+| cudnn_engines_precompiled64_9.dll | 490.1 MB | 不要 |
+| cudnn_adv64_9.dll | 269.4 MB | 不要 |
+| cudnn_heuristic64_9.dll | 54.2 MB | 不要 |
+| cudnn_engines_runtime_compiled64_9.dll | 19.3 MB | 不要 |
+| cudnn_cnn64_9.dll | 4.4 MB | 不要 |
+
+これに `onnxruntime_providers_cuda.dll`(92.0 MB)が乗って約 823 MB。
+
+> **罠**: `cudnn_ops64_9.dll` を抜くと EP の登録は成功して
+> `execution provider: CUDA` まで表示され、**最初の推論で落ちる**
+> (`Cannot load symbol cudnnCreateReduceTensorDescriptor`)。cuDNN のサブライブラリは
+> 遅延ロードなので、起動確認だけの動作テストではすり抜ける。
+> [main.rs](crates/glyph-infer/src/main.rs) の CPU フォールバックもこの失敗は拾えない。
 
 ## モデルアーキテクチャ
 
