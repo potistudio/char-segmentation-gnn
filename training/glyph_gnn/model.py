@@ -491,7 +491,7 @@ MODEL_HPARAM_KEYS = frozenset(
     {"node_dim", "edge_dim", "hidden", "layers", "heads", "dropout", "context",
      "contour_dim", "contours", "relations", "group"}
 )
-GRAPH_HPARAM_KEYS = frozenset({"knn", "radius", "contour_bridge"})
+GRAPH_HPARAM_KEYS = frozenset({"knn", "radius", "contour_bridge", "stack_bridge"})
 
 
 #: Components added after checkpoints already existed. A checkpoint from before

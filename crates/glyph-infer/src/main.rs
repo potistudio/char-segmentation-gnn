@@ -47,6 +47,11 @@ struct Args {
     #[arg(long, default_value_t = 0.35)]
     contour_bridge: f32,
 
+    /// Vertical gap allowed when bridging contours that share a horizontal slot
+    /// (must match training for best results).
+    #[arg(long, default_value_t = 1.0)]
+    stack_bridge: f32,
+
     /// Force CPU execution (skip the CUDA execution provider).
     #[arg(long)]
     cpu: bool,
@@ -176,11 +181,12 @@ impl Engine {
     }
 }
 
-fn graph_config(knn: usize, radius: f32, contour_bridge: f32) -> GraphConfig {
+fn graph_config(knn: usize, radius: f32, contour_bridge: f32, stack_bridge: f32) -> GraphConfig {
     GraphConfig {
         knn,
         radius,
         contour_bridge,
+        stack_bridge,
         ..GraphConfig::default()
     }
 }
@@ -188,7 +194,12 @@ fn graph_config(knn: usize, radius: f32, contour_bridge: f32) -> GraphConfig {
 fn main() -> Result<()> {
     let args = Args::parse();
     let mut engine = Engine::new(&args.model, !args.cpu, args.threshold)?;
-    let graph_cfg = graph_config(args.knn, args.radius, args.contour_bridge);
+    let graph_cfg = graph_config(
+        args.knn,
+        args.radius,
+        args.contour_bridge,
+        args.stack_bridge,
+    );
 
     match &args.cmd {
         Command::Demo {

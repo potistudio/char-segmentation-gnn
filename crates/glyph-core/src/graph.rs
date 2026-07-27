@@ -54,6 +54,10 @@ pub struct GraphConfig {
     /// stroke links even when points are within [`radius`]; bridges ensure
     /// every nearby contour pair is scored by the model.
     pub contour_bridge: f32,
+    /// Also bridge a contour pair that shares a horizontal slot -- see
+    /// [`stacked`] -- when their vertical gap is within this limit (em).
+    /// 0 disables the rule.
+    pub stack_bridge: f32,
 }
 
 impl Default for GraphConfig {
@@ -63,6 +67,7 @@ impl Default for GraphConfig {
             knn: 8,
             radius: 0.25,
             contour_bridge: 0.35,
+            stack_bridge: 1.0,
         }
     }
 }
@@ -101,6 +106,30 @@ impl GraphSample {
     pub fn num_edges(&self) -> usize {
         self.edge_index.len() / 2
     }
+}
+
+/// How much of the narrower box must overlap in x for two contours to count as
+/// sharing a horizontal slot.
+const STACK_OVERLAP: f32 = 0.5;
+
+/// Whether two contour boxes occupy the same horizontal slot, within a vertical
+/// gap of `limit` em.
+///
+/// In horizontal text a character owns its slot, so contours that share one
+/// belong together however far apart they sit vertically -- the two strokes of
+/// "二", the three of "三", the top and bottom of "こ". Plain distance cannot
+/// express that: the strokes of "二" are 0.5 em apart, and a `contour_bridge`
+/// wide enough to reach them also links horizontally adjacent characters, which
+/// multiplies the decisions the model has to get every one of right (measured:
+/// +46% contour pairs on ordinary text, for no gain in reachability there).
+fn stacked(a: &[f32; 4], b: &[f32; 4], limit: f32) -> bool {
+    if limit <= 0.0 {
+        return false;
+    }
+    let overlap = a[2].min(b[2]) - a[0].max(b[0]);
+    let narrower = (a[2] - a[0]).min(b[2] - b[0]).max(f32::EPSILON);
+    let gap = (b[1] - a[3]).max(a[1] - b[3]).max(0.0);
+    overlap >= STACK_OVERLAP * narrower && gap <= limit
 }
 
 struct NodeInfo {
@@ -207,14 +236,25 @@ pub fn build_graph(contours: &[ContourInstance], upem: f32, cfg: &GraphConfig) -
         }
     }
 
-    // Bridge edges: one closest-node link per contour pair within contour_bridge.
-    // kNN caps often omit these when dense local neighbours fill the budget.
-    if cfg.contour_bridge > 0.0 {
+    // Bridge edges: one closest-node link per contour pair, under either rule
+    // below. kNN caps often omit these when dense local neighbours fill the
+    // budget, and without an edge no threshold and no model can ever group the
+    // pair -- it is a hard ceiling on recall.
+    if cfg.contour_bridge > 0.0 || cfg.stack_bridge > 0.0 {
         let contour_count = pending.len();
         let mut contour_nodes: Vec<Vec<usize>> = vec![Vec::new(); contour_count];
         for (i, n) in nodes.iter().enumerate() {
             contour_nodes[n.contour_id as usize].push(i);
         }
+        // Bounding boxes in normalized units: [x0, y0, x1, y1].
+        let boxes: Vec<[f32; 4]> = pending
+            .iter()
+            .map(|p| {
+                let x0 = (p.bbox_min[0] - min_x) * scale;
+                let y0 = p.bbox_min[1] * scale;
+                [x0, y0, x0 + p.bbox_wh[0] * scale, y0 + p.bbox_wh[1] * scale]
+            })
+            .collect();
         let bridge_sq = cfg.contour_bridge * cfg.contour_bridge;
         for ca in 0..contour_count {
             for cb in (ca + 1)..contour_count {
@@ -231,11 +271,11 @@ pub fn build_graph(contours: &[ContourInstance], upem: f32, cfg: &GraphConfig) -
                         }
                     }
                 }
-                if best_dist_sq <= bridge_sq {
-                    if let Some((i, j)) = best_pair {
-                        let (a, b) = if i < j { (i, j) } else { (j, i) };
-                        pairs.insert((a as u32, b as u32));
-                    }
+                let near = cfg.contour_bridge > 0.0 && best_dist_sq <= bridge_sq;
+                let linked = near || stacked(&boxes[ca], &boxes[cb], cfg.stack_bridge);
+                if let (true, Some((i, j))) = (linked, best_pair) {
+                    let (a, b) = if i < j { (i, j) } else { (j, i) };
+                    pairs.insert((a as u32, b as u32));
                 }
             }
         }

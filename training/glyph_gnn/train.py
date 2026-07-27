@@ -330,6 +330,9 @@ def main() -> None:
     ap.add_argument("--radius", type=float, default=0.25, help="graph radius (em) used when generating training data")
     ap.add_argument("--contour-bridge", type=float, default=0.35,
                     help="contour-pair bridge distance (em) used when generating training data")
+    ap.add_argument("--stack-bridge", type=float, default=1.0,
+                    help="vertical gap (em) allowed for same-slot contour bridges,"
+                         " as used when generating training data")
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     ap.add_argument("--no-progress", action="store_true", help="disable progress bars")
     args = ap.parse_args()
@@ -387,6 +390,7 @@ def main() -> None:
         knn=args.knn,
         radius=args.radius,
         contour_bridge=args.contour_bridge,
+        stack_bridge=args.stack_bridge,
     )
     optim = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(optim, T_max=args.epochs)

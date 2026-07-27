@@ -90,6 +90,11 @@ struct Args {
     #[arg(long, default_value_t = 0.35)]
     contour_bridge: f32,
 
+    /// Graph construction: also bridge contour pairs sharing a horizontal slot
+    /// (the strokes of a stacked character) within this vertical gap (em).
+    #[arg(long, default_value_t = 1.0)]
+    stack_bridge: f32,
+
     /// Contour resampling spacing in em units.
     #[arg(long, default_value_t = 0.05)]
     spacing: f32,
@@ -374,6 +379,7 @@ fn main() -> Result<()> {
         knn: args.knn,
         radius: args.radius,
         contour_bridge: args.contour_bridge,
+        stack_bridge: args.stack_bridge,
     };
 
     fs::create_dir_all(&args.out)?;
