@@ -14,7 +14,7 @@ use std::time::Instant;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-use ort::execution_providers::CUDAExecutionProvider;
+use ort::ep::{CUDA, DirectML};
 use ort::session::Session;
 use ort::session::builder::GraphOptimizationLevel;
 use ort::value::Tensor;
@@ -52,9 +52,14 @@ struct Args {
     #[arg(long, default_value_t = 1.0)]
     stack_bridge: f32,
 
-    /// Force CPU execution (skip the CUDA execution provider).
+    /// Force CPU execution (skip the GPU execution provider).
     #[arg(long)]
     cpu: bool,
+
+    /// Use DirectML instead of CUDA. Ships as a single 18 MB DLL and runs on
+    /// any DX12 adapter, where CUDA drags in ~820 MB of cuDNN and cuBLAS.
+    #[arg(long, conflicts_with = "cpu")]
+    directml: bool,
 
     #[command(subcommand)]
     cmd: Command,
@@ -98,13 +103,21 @@ fn ort_err<R>(e: ort::Error<R>) -> anyhow::Error {
     anyhow::anyhow!("{e}")
 }
 
+/// Which GPU execution provider to try before falling back to CPU.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Backend {
+    Cpu,
+    Cuda,
+    DirectML,
+}
+
 struct Engine {
     session: Session,
     threshold: f32,
 }
 
 impl Engine {
-    fn new(model: &PathBuf, use_cuda: bool, threshold: f32) -> Result<Self> {
+    fn new(model: &PathBuf, backend: Backend, threshold: f32) -> Result<Self> {
         let base = || -> Result<_> {
             Session::builder()
                 .map_err(ort_err)?
@@ -114,22 +127,41 @@ impl Engine {
                 .map_err(ort_err)
         };
 
-        // Try CUDA strictly first so a registration failure is visible
-        // instead of silently degrading to CPU.
-        if use_cuda {
-            let attempt = base()?
-                .with_execution_providers([CUDAExecutionProvider::default()
-                    .build()
-                    .error_on_failure()])
-                .map_err(ort_err)
-                .and_then(|mut b| b.commit_from_file(model).map_err(ort_err));
-            match attempt {
+        // Try the GPU provider strictly first so a registration failure is
+        // visible instead of silently degrading to CPU.
+        let attempt = match backend {
+            Backend::Cpu => None,
+            Backend::Cuda => Some(
+                base()?
+                    .with_execution_providers([CUDA::default().build().error_on_failure()])
+                    .map_err(ort_err),
+            ),
+            // DirectML allocates its own resources per run and rejects both
+            // of these, so they have to come off before the EP is registered.
+            Backend::DirectML => Some(
+                base()?
+                    .with_memory_pattern(false)
+                    .map_err(ort_err)
+                    .and_then(|b| b.with_parallel_execution(false).map_err(ort_err))
+                    .and_then(|b| {
+                        b.with_execution_providers([DirectML::default().build().error_on_failure()])
+                            .map_err(ort_err)
+                    }),
+            ),
+        };
+        if let Some(builder) = attempt {
+            let name = if backend == Backend::Cuda {
+                "CUDA"
+            } else {
+                "DirectML"
+            };
+            match builder.and_then(|mut b| b.commit_from_file(model).map_err(ort_err)) {
                 Ok(session) => {
-                    eprintln!("execution provider: CUDA");
+                    eprintln!("execution provider: {name}");
                     return Ok(Self { session, threshold });
                 }
                 Err(e) => {
-                    eprintln!("warning: CUDA EP unavailable ({e}); falling back to CPU");
+                    eprintln!("warning: {name} EP unavailable ({e}); falling back to CPU");
                 }
             }
         }
@@ -193,7 +225,12 @@ fn graph_config(knn: usize, radius: f32, contour_bridge: f32, stack_bridge: f32)
 
 fn main() -> Result<()> {
     let args = Args::parse();
-    let mut engine = Engine::new(&args.model, !args.cpu, args.threshold)?;
+    let backend = match (args.cpu, args.directml) {
+        (true, _) => Backend::Cpu,
+        (_, true) => Backend::DirectML,
+        _ => Backend::Cuda,
+    };
+    let mut engine = Engine::new(&args.model, backend, args.threshold)?;
     let graph_cfg = graph_config(
         args.knn,
         args.radius,
