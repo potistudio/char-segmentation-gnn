@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/glyph-core", "crates/dataset-gen", "crates/glyph-infer"]
+members = ["crates/glyph-core", "crates/dataset-gen", "crates/glyph-infer", "crates/glyph-nn"]
 
 [workspace.package]
 edition = "2024"
@@ -15,3 +15,4 @@ lto = true
 
 [workspace.dependencies]
 glyph-core = { path = "crates/glyph-core" }
+glyph-nn = { path = "crates/glyph-nn" }

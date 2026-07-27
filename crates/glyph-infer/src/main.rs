@@ -10,7 +10,7 @@ mod export;
 mod postprocess;
 
 use std::borrow::Cow;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use anyhow::{Context, Result};
@@ -31,6 +31,12 @@ struct Args {
     /// Path to the exported ONNX model.
     #[arg(long)]
     model: PathBuf,
+
+    /// Run the native CPU path (`glyph-nn`) against this `.gnnw` weight dump
+    /// instead of onnxruntime. `--model` is still required so the two can be
+    /// compared on one command line.
+    #[arg(long)]
+    native: Option<PathBuf>,
 
     /// Edge probability threshold for the same-character decision.
     #[arg(long, default_value_t = 0.5)]
@@ -117,23 +123,38 @@ enum Backend {
     DirectML,
 }
 
+/// What actually evaluates the model.
+enum Runtime {
+    /// onnxruntime. `selective` records whether the model takes a `scored`
+    /// input; models exported before it exists score every edge, so both
+    /// shapes stay loadable.
+    Ort { session: Session, selective: bool },
+    /// The hand-written CPU path in `glyph-nn`, which always scores a subset.
+    Native(glyph_nn::Model),
+}
+
 struct Engine {
-    session: Session,
+    runtime: Runtime,
     threshold: f32,
-    /// Whether the model takes a `scored` input, i.e. runs its classifier on a
-    /// chosen subset of the edges. Models exported before that input exists
-    /// score every edge, so both shapes stay loadable.
-    selective: bool,
 }
 
 impl Engine {
     fn wrap(session: Session, threshold: f32) -> Self {
         let selective = session.inputs().iter().any(|i| i.name() == "scored");
         Self {
-            session,
+            runtime: Runtime::Ort { session, selective },
             threshold,
-            selective,
         }
+    }
+
+    fn native(weights: &Path, threshold: f32) -> Result<Self> {
+        let model = glyph_nn::Model::load(weights)
+            .map_err(|e| anyhow::anyhow!("loading {}: {e}", weights.display()))?;
+        eprintln!("execution provider: native (glyph-nn)");
+        Ok(Self {
+            runtime: Runtime::Native(model),
+            threshold,
+        })
     }
 
     fn new(model: &PathBuf, backend: Backend, threads: usize, threshold: f32) -> Result<Self> {
@@ -219,7 +240,11 @@ impl Engine {
         let c = g.num_contours as usize;
         let contour_dim = g.contour_dim as usize;
 
-        let scored = if self.selective {
+        let selective = match &self.runtime {
+            Runtime::Ort { selective, .. } => *selective,
+            Runtime::Native(_) => true,
+        };
+        let scored = if selective {
             Self::scored_edges(g)
         } else {
             (0..e as i64).collect()
@@ -231,6 +256,19 @@ impl Engine {
         if scored.is_empty() {
             return Ok(vec![1.0; e]);
         }
+
+        if let Runtime::Native(model) = &self.runtime {
+            let picked: Vec<u32> = scored.iter().map(|&v| v as u32).collect();
+            let probs = model.run(g, &picked);
+            let mut full = vec![1.0f32; e];
+            for (slot, &edge) in scored.iter().enumerate() {
+                full[edge as usize] = probs[slot];
+            }
+            return Ok(full);
+        }
+        let Runtime::Ort { session, .. } = &mut self.runtime else {
+            unreachable!("native path returned above");
+        };
 
         // i64 indices as required by the ONNX graph (torch.long).
         let edge_index: Vec<i64> = g.edge_index.iter().map(|&v| v as i64).collect();
@@ -252,16 +290,16 @@ impl Engine {
             "node_contour_ids" => cids,
             "contour_features" => cattr,
         ];
-        if self.selective {
+        if selective {
             let picked = Tensor::from_array(([scored.len()], scored.clone())).map_err(ort_err)?;
             feed.push((Cow::from("scored"), SessionInputValue::from(picked)));
         }
 
-        let outputs = self.session.run(feed).map_err(ort_err)?;
+        let outputs = session.run(feed).map_err(ort_err)?;
         let (_, probs) = outputs["edge_probs"]
             .try_extract_tensor::<f32>()
             .map_err(ort_err)?;
-        if !self.selective {
+        if !selective {
             return Ok(probs.to_vec());
         }
         let mut full = vec![1.0f32; e];
@@ -289,7 +327,10 @@ fn main() -> Result<()> {
         (_, true) => Backend::DirectML,
         _ => Backend::Cuda,
     };
-    let mut engine = Engine::new(&args.model, backend, args.threads, args.threshold)?;
+    let mut engine = match &args.native {
+        Some(weights) => Engine::native(weights, args.threshold)?,
+        None => Engine::new(&args.model, backend, args.threads, args.threshold)?,
+    };
     let graph_cfg = graph_config(
         args.knn,
         args.radius,
