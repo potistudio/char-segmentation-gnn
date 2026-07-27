@@ -419,10 +419,22 @@ dependencies = [
  "anyhow",
  "clap",
  "glyph-core",
+ "glyph-nn",
  "ort",
  "rand",
  "rand_pcg",
  "rmp-serde",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "glyph-nn"
+version = "0.0.1"
+dependencies = [
+ "glyph-core",
+ "matrixmultiply",
+ "rayon",
  "serde",
  "serde_json",
 ]
