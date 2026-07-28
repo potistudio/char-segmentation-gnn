@@ -287,35 +287,47 @@ impl Model {
             self.w.get(&p("lin_dst.bias")),
             &mut h_dst,
         );
-        let mut h_edge = vec![0.0f32; e * hidden];
-        linear(
-            &g.edge_features,
-            e,
-            self.w.get(&p("lin_edge.weight")),
-            self.w.get(&p("lin_edge.bias")),
-            &mut h_edge,
-        );
         let att = self.w.get(&p("att"));
+        // `lin_edge` maps 4 columns to `hidden`, so as a call it writes an
+        // [edges, hidden] buffer -- 5.4 MB out and 5.4 MB back per layer on a
+        // typical line -- to save 512 multiply-adds per edge that the loop
+        // below is walking anyway. Its weights are 2 KB and stay in L1, so
+        // folding it in trades 43 MB of traffic over four layers for nothing.
+        let we = self.w.get(&p("lin_edge.weight"));
+        let be = self.w.get(&p("lin_edge.bias"));
+        let edge_dim = hp.edge_dim;
 
         // Pass 1: attention logits per edge, and the global maximum the
         // reference subtracts before exponentiating.
+        //
+        // Walked in destination order, so `logits` comes out grouped the way
+        // pass 2 reads it and consecutive edges share a destination -- one
+        // `h_dst` row now serves a node's whole fan-in instead of being
+        // re-fetched per edge.
         let mut logits = vec![0.0f32; e * heads];
         logits
             .par_chunks_mut(heads)
             .enumerate()
-            .for_each(|(edge, row)| {
+            .for_each(|(slot, row)| {
+                let edge = incoming.edges[slot] as usize;
                 let s = src[edge] as usize * hidden;
                 let d = dst[edge] as usize * hidden;
-                let x = edge * hidden;
-                for (head, slot) in row.iter_mut().enumerate() {
+                let attr = &g.edge_features[edge * edge_dim..(edge + 1) * edge_dim];
+                for (head, out) in row.iter_mut().enumerate() {
                     let base = head * head_dim;
                     let mut total = 0.0;
                     for k in 0..head_dim {
-                        let z = h_src[s + base + k] + h_dst[d + base + k] + h_edge[x + base + k];
+                        let j = base + k;
+                        let mut edge_term = be.data[j];
+                        let column = &we.data[j * edge_dim..(j + 1) * edge_dim];
+                        for (value, weight) in attr.iter().zip(column) {
+                            edge_term += value * weight;
+                        }
+                        let z = h_src[s + j] + h_dst[d + j] + edge_term;
                         let z = if z >= 0.0 { z } else { LEAKY_SLOPE * z };
-                        total += z * att.data[base + k];
+                        total += z * att.data[j];
                     }
-                    *slot = total;
+                    *out = total;
                 }
             });
         let peak = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
@@ -328,21 +340,26 @@ impl Model {
         agg.par_chunks_mut(hidden).enumerate().for_each_init(
             || (vec![0.0f32; heads], Vec::<f32>::new()),
             |(denom, numerators), (node, row)| {
-                let edges = incoming.of(node);
-                if edges.is_empty() {
+                let (from, to) = (
+                    incoming.start[node] as usize,
+                    incoming.start[node + 1] as usize,
+                );
+                if from == to {
                     return;
                 }
                 denom.fill(0.0);
                 numerators.clear();
-                for &edge in edges {
-                    for (head, total) in denom.iter_mut().enumerate() {
-                        let num = (logits[edge as usize * heads + head] - peak).exp();
+                // Contiguous now that pass 1 wrote in destination order.
+                for value in &logits[from * heads..to * heads] {
+                    numerators.push((value - peak).exp());
+                }
+                for chunk in numerators.chunks_exact(heads) {
+                    for (total, num) in denom.iter_mut().zip(chunk) {
                         *total += num;
-                        numerators.push(num);
                     }
                 }
-                for (i, &edge) in edges.iter().enumerate() {
-                    let s = src[edge as usize] as usize * hidden;
+                for (i, slot) in (from..to).enumerate() {
+                    let s = src[incoming.edges[slot] as usize] as usize * hidden;
                     for (head, total) in denom.iter().enumerate() {
                         let alpha = numerators[i * heads + head] / (total + 1e-9);
                         let base = head * head_dim;
