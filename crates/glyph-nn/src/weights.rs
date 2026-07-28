@@ -41,7 +41,41 @@ pub struct HParams {
 pub struct View<'a> {
     pub data: &'a [f32],
     pub rows: usize,
+    /// Columns actually used. May be fewer than [`stride`](Self::stride), which
+    /// is how [`prefix`](Self::prefix) narrows a matrix without copying it.
     pub cols: usize,
+    /// Distance between the starts of two rows.
+    pub stride: usize,
+}
+
+impl<'a> View<'a> {
+    pub fn new(data: &'a [f32], rows: usize, cols: usize) -> Self {
+        Self {
+            data,
+            rows,
+            cols,
+            stride: cols,
+        }
+    }
+
+    /// The first `cols` columns of every row.
+    ///
+    /// Lets a caller drop trailing input channels from a `Linear` when their
+    /// contribution is constant and has already been folded into the bias.
+    pub fn prefix(self, cols: usize) -> Self {
+        debug_assert!(cols <= self.cols);
+        Self { cols, ..self }
+    }
+
+    /// The columns from `cols` onward.
+    pub fn suffix(self, cols: usize) -> Self {
+        debug_assert!(cols <= self.cols);
+        Self {
+            data: &self.data[cols..],
+            cols: self.cols - cols,
+            ..self
+        }
+    }
 }
 
 /// Every tensor of one checkpoint, in a single allocation.
@@ -142,10 +176,10 @@ impl Weights {
 
     pub fn try_get(&self, name: &str) -> Option<View<'_>> {
         let &(start, rows, cols) = self.index.get(name)?;
-        Some(View {
-            data: &self.data[start..start + rows * cols],
+        Some(View::new(
+            &self.data[start..start + rows * cols],
             rows,
             cols,
-        })
+        ))
     }
 }

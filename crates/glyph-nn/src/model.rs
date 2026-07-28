@@ -10,7 +10,7 @@ use glyph_core::GraphSample;
 use rayon::prelude::*;
 
 use crate::ops::{Incoming, layer_norm, linear, relu, softmax_rows};
-use crate::weights::{HParams, LoadError, Weights};
+use crate::weights::{HParams, LoadError, View, Weights};
 
 /// Columns of a `contour_attr` row, matching `crates/glyph-core/src/graph.rs`
 /// and the constants at the top of `model.py`.
@@ -557,13 +557,32 @@ impl Model {
         let (src, dst) = g.edge_index.split_at(g.num_edges());
         let (hidden, c) = (hp.hidden, g.num_contours as usize);
         let edge_dim = hp.edge_dim;
-        let width = hidden * if summary.is_some() { 4 } else { 3 }
+        // Columns that differ per edge. The graph summary is the same vector in
+        // every row, so its contribution to the first layer is a constant --
+        // folded into the bias below instead of being copied into thousands of
+        // rows and multiplied by the same weights each time. That drops the
+        // widest matrix in the model from 527 columns to 399.
+        let width = 3 * hidden
             + edge_dim
             + if relations.is_some() {
                 CONTOUR_RELATIONS
             } else {
                 0
             };
+        let first_w = self.w.get("classifier.0.weight");
+        let folded_bias = match summary {
+            None => self.w.get("classifier.0.bias").data.to_vec(),
+            Some(line) => {
+                let mut bias = self.w.get("classifier.0.bias").data.to_vec();
+                let tail = first_w.suffix(width);
+                for (row, slot) in bias.iter_mut().enumerate() {
+                    let at = row * tail.stride;
+                    let weights = &tail.data[at..at + tail.cols];
+                    *slot += line.iter().zip(weights).map(|(a, b)| a * b).sum::<f32>();
+                }
+                bias
+            }
+        };
 
         let mut feats = vec![0.0f32; scored.len() * width];
         feats
@@ -587,10 +606,6 @@ impl Model {
                     let from = (ca * c + cb) * CONTOUR_RELATIONS;
                     row[at..at + CONTOUR_RELATIONS]
                         .copy_from_slice(&table[from..from + CONTOUR_RELATIONS]);
-                    at += CONTOUR_RELATIONS;
-                }
-                if let Some(line) = summary {
-                    row[at..at + hidden].copy_from_slice(line);
                 }
             });
 
@@ -599,8 +614,8 @@ impl Model {
         linear(
             &feats,
             rows,
-            self.w.get("classifier.0.weight"),
-            self.w.get("classifier.0.bias"),
+            first_w.prefix(width),
+            View::new(&folded_bias, 1, hidden),
             &mut first,
         );
         relu(&mut first);
